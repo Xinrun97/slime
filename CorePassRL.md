@@ -1,0 +1,698 @@
+# CorePassRL：基于 slime + simple-coding-harness 训练自研编程大模型
+
+## 一、整体思路与架构选择
+
+**架构定位**：slime 主导整个训练循环，simple-coding-harness 只提供 agent 逻辑（工具调用、文件编辑、多轮对话管理）。LLM 推理完全由 slime 管理的 SGLang 引擎负责，harness 的 LLM 调用经由 shim 透明转发给 SGLang，harness 自身感知不到这一层替换。
+
+**权重同步机制**（来自 `train.py:93`）：每个 rollout_id 循环末尾都执行 `actor_model.update_weights()`，把 Megatron 最新训练权重同步到 SGLang 推理引擎。因此每轮"生成→训练→生成→训练"循环中，下一轮生成用的就是当前最新的模型权重。
+
+**关键发现**：simple-coding-harness 里已经有 `QWEN36_27B_API_BASE` / `QWEN36_27B_API_KEY` 这两个环境变量，专门为本地 Qwen3.6-27B 服务设计。`api_key` 会被 LiteLLM 作为 `Authorization: Bearer {key}` 发出——这和 `coding_agent_rl` 里把 session_id 塞进 `ANTHROPIC_AUTH_TOKEN` 的机制完全相同。
+
+因此集成点极为干净：**不需要修改两个项目的任何一行代码**。
+
+**训练大循环**（来自 `train.py`）：
+
+```
+for rollout_id in range(num_rollout):
+    rollout_data = rollout_manager.generate(rollout_id)   # SGLang 推理 + 沙箱执行
+    actor_model.train(rollout_data)                        # Megatron 训练
+    actor_model.update_weights()                           # 权重同步到 SGLang ← 每步必执行
+```
+
+**核心结构**（含 AgentCore）：
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  slime 训练大循环（train.py）                     训练集群（自有 GPU）    │
+│  ┌─────────────────┐   权重同步(每步)   ┌───────────────────────────┐   │
+│  │ Megatron 训练    │ ────────────────→ │ SGLang 推理引擎             │   │
+│  │ (Qwen3-27B)     │                   │ (args.sglang_router_*)     │   │
+│  └─────────────────┘                   └─────────────┬─────────────┘   │
+│                                                       │ /generate       │
+│                         ┌─────────────────────────────▼───────────────┐ │
+│                         │  harness_rl/shim.py（VPC 内网端口）           │ │
+│                         │  · OpenAI /v1/chat/completions               │ │
+│                         │  · 记录 TurnRecord + session 轨迹状态         │ │
+│                         └─────────────────────────────┬───────────────┘ │
+└───────────────────────────────────────────────────────│─────────────────┘
+                          Bearer={session_id}，VPC 内网（同 Region）↑
+┌───────────────────────────────────────────────────────│─────────────────┐
+│  AWS AgentCore Runtime（托管 microVM，按需自动扩缩容）                    │
+│                         ┌─────────────────────────────▼───────────────┐ │
+│                         │  harness/agentcore_rl.py（已有代码，不改）    │ │
+│                         │  @rollout_entrypoint → 后台执行，立刻返回     │ │
+│                         │  · 设置 QWEN36_27B_API_BASE=shim公网地址      │ │
+│                         │  · 设置 QWEN36_27B_API_KEY=session_id        │ │
+│                         │  · 运行 run_cloud()（harness agent 主循环）   │ │
+│                         │  · 计算 reward_breakdown，写入 S3            │ │
+│                         └──────────────────────────────────────────────┘ │
+│                 ↓ 结果自动保存到 S3（{exp_id}/{session_id}/result.json）  │
+└─────────────────────────────────────────────────────────────────────────┘
+         ↑ RolloutClient.invoke_async() / future.result_async()
+         来自 harness_rl/rollout_fn.py 的 custom_generate
+```
+
+---
+
+## 二、代码仓库布局
+
+```
+slime/
+└── examples/
+    └── harness_rl/
+        ├── shim.py           # Component A：OpenAI shim + 轨迹记录（训练集群上运行）
+        ├── rollout_fn.py     # Component B：--custom-generate-function-path
+        ├── agentcore_client.py  # Component C：AgentCore RolloutClient 封装（替代 sandbox.py）
+        ├── reward.py         # Component D：奖励函数包装（从 S3 结果取值）
+        ├── dataset.py        # Component E：数据集格式转换
+        ├── launch.sh         # 训练启动脚本（示例）
+        └── README.md
+```
+
+**不修改任何项目代码**：
+- `simple-coding-harness/src/services/sandbox/agentcore_rl.py` 已有 `@rollout_entrypoint`，直接用
+- `simple-coding-harness/rl_data/collect_rollouts.py` 的 `RolloutClient` 用法是参考模板
+- harness 的 Docker 镜像已部署到 AgentCore Runtime，包含所有依赖
+
+---
+
+## 三、Component A：Shim（`shim.py`）
+
+**职责**：实现 OpenAI `/v1/chat/completions` API，内部调 SGLang `/generate`，记录每轮的 `TurnRecord`，最后按 session 汇出 `TurnSegment`。
+
+**启动方式**：与 `coding_agent_rl/middleware.py` 完全相同——在 rollout 进程内以后台守护线程运行，只启动一次（单例）。
+
+### 3.1 HTTP 路由
+
+```
+POST /v1/chat/completions     ← LiteLLM 调用入口
+GET  /v1/models               ← LiteLLM 健康探测
+GET  /healthz                 ← 启动就绪检查
+```
+
+### 3.2 每轮请求处理流程
+
+```
+1. 从 Authorization: Bearer {token} 提取 session_id
+2. 获取该 session 的 Chain（对话状态机）
+3. 检测是否发生 "wipe"（上下文压缩）：
+   比较新 messages 与已记录的历史
+   若不是已有历史的延伸 → 快照当前 turns 为 kind="wipe" TurnSegment
+4. 用 tokenizer.apply_chat_template(messages, tools) 计算 prompt_ids
+5. POST SGLang /generate：
+   {"input_ids": prompt_ids, "return_logprob": true, "sampling_params": {...}}
+6. 从响应提取 output_token_logprobs → output_ids, output_log_probs
+7. 存储 TurnRecord(prompt_ids, output_ids, log_probs)
+8. 解析 output_ids → reasoning + text + tool_calls（复用 slime.agent.parsing）
+9. 构造 OpenAI response 返回给 LiteLLM
+```
+
+### 3.3 Wipe 检测
+
+harness 在 token 数超过阈值时会调用 `_llm_compact_history()`，将旧消息替换为摘要。检测方式：
+
+```python
+def _is_wipe(chain: Chain, new_messages: list[dict]) -> bool:
+    if chain.seen_msgs == 0:
+        return False
+    # 新 messages 的前 N 条不匹配已记录历史 → 发生了 wipe
+    overlap = min(len(new_messages), len(chain.msg_hashes))
+    for i in range(overlap):
+        if _hash_msg(new_messages[i]) != chain.msg_hashes[i]:
+            return True
+    return False
+```
+
+检测到 wipe 时，把当前 `chain.turns` 快照为 `kind="wipe"` 的 `TurnSegment`，然后清空 `chain.turns` 重新开始。
+
+### 3.4 SGLang 连接
+
+shim 从 `args` 里直接读取 slime 自动注入的 SGLang 地址（与 `coding_agent_rl/generate.py:90` 相同）：
+
+```python
+sglang_url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}"
+```
+
+`args.sglang_router_ip` 和 `args.sglang_router_port` 由 slime 在启动 SGLang 引擎时自动设置，无需额外配置。
+
+### 3.5 Session 管理 API（内部，供 rollout_fn 调用）
+
+```python
+def open_session(store, session_id, *, tokenizer, tools_schema, sampling_defaults): ...
+def pop_session_split(store, session_id) -> list[TurnSegment]: ...  # 同 coding_agent_rl
+def shutdown_session(store, session_id): ...
+```
+
+`pop_session_split` 和 `merge_turn_segments` 直接复用 `slime.agent.trajectory`，零重复代码。
+
+### 3.6 与 coding_agent_rl/middleware.py 的对比
+
+| | coding_agent_rl | harness_rl（本方案）|
+|---|---|---|
+| 对外 API | Anthropic Messages API | OpenAI Chat Completions API |
+| 消息翻译 | Anthropic blocks → chat_template | OpenAI messages → chat_template（更简单）|
+| Session 识别 | `ANTHROPIC_AUTH_TOKEN` | `QWEN36_27B_API_KEY`（Bearer token）|
+| 推理引擎 | SGLang `/generate` | SGLang `/generate`（相同）|
+| 轨迹记录 | TurnRecord + merge_turns | TurnRecord + merge_turns（复用）|
+
+---
+
+## 四、Component B：Rollout 函数（`rollout_fn.py`）
+
+使用 `--custom-generate-function-path`，复用 slime 默认 rollout 外层循环。
+
+### 4.1 签名
+
+```python
+async def custom_generate(args, sample: Sample, sampling_params: dict) -> list[Sample]:
+```
+
+### 4.2 完整流程（使用 AgentCore）
+
+```python
+SHIM_PUBLIC_URL = os.environ["SHIM_PUBLIC_URL"]   # 训练前 export，AgentCore 能访问的 shim 地址
+SWE_TIME_BUDGET_SEC = int(os.environ.get("SWE_TIME_BUDGET_SEC", "600"))
+
+async def custom_generate(args, sample, sampling_params):
+    state = _State.get(args)          # 单例：初始化 tokenizer + shim + AgentCore client
+
+    session_id = f"cagent-{sample.index}-{sample.group_index}-{secrets.token_hex(4)}"
+    open_session(state.store, session_id,
+                 tokenizer=state.tokenizer,
+                 tools_schema=HARNESS_TOOLS_SCHEMA,
+                 sampling_defaults=sampling_params)
+
+    # sample.metadata 由 dataset.py 构造，包含 config 和 env_vars 两个字段
+    task_config = sample.metadata.get("config", {})
+    task_env_vars = sample.metadata.get("env_vars", {})
+
+    # 1. 提交到 AgentCore（异步，立刻返回 future）
+    #    env_vars 直接设置 QWEN36_27B_API_BASE 和 QWEN36_27B_API_KEY，
+    #    AgentCore 的 agentcore_rl.py 会把它们注入 harness 进程环境
+    payload = {
+        "action": "start",
+        "config": task_config,
+        "env_vars": {
+            **task_env_vars,  # 任务自带的 env（如 GITHUB_TOKEN）
+            "MODEL": "openai/qwen3.6-27b",
+            "QWEN36_27B_API_BASE": f"{SHIM_PUBLIC_URL}/v1",
+            "QWEN36_27B_API_KEY": session_id,  # shim 用此识别 session
+            "HARNESS_EXTENDED_THINKING": "0",
+            "HARNESS_LLM_NUM_RETRIES": "1",
+        },
+    }
+    future = await state.agentcore_client.invoke_async(payload)
+
+    # 2. 等待 AgentCore 完成（harness 执行 + 评估 + 奖励全在 agentcore_rl.py 里）
+    try:
+        s3_result = await future.result_async(timeout=SWE_TIME_BUDGET_SEC)
+        reward = float(s3_result.get("rewards", 0.0))
+        timed_out = False
+    except TimeoutError:
+        reward = -1.0
+        s3_result = {}
+        timed_out = True
+
+    # 3. 取出 shim 记录的 TokenSegment（在 EC2 训练节点的进程内存中）
+    segments = pop_session_split(state.store, session_id)
+    shutdown_session(state.store, session_id)
+
+    # 4. 构建训练样本
+    # 超时或 shim 无轨迹（agent 未发任何请求）时返回 ABORTED 样本，
+    # 而非空列表——slime 的 generate_and_rm_group 期望至少一个 Sample
+    if not segments or timed_out:
+        sample.status = Sample.Status.ABORTED
+        return [sample]
+
+    return fan_out_sample_segments(
+        sample, segments, reward,
+        state.tokenizer,
+        metadata={"s3_result": s3_result},
+    )
+```
+
+**关键点**：奖励由 AgentCore 内的 `agentcore_rl.py` 计算（调用 harness 自己的 `compose_reward`），通过 S3 返回。训练集群只取 `s3_result["rewards"]`，不需要重新运行评估。
+
+---
+
+## 五、Component C：AgentCore 客户端封装（`agentcore_client.py`）
+
+封装 `RolloutClient`，在 slime 的 `_State` 单例里初始化：
+
+```python
+from agentcore_rl_toolkit import RolloutClient
+
+AGENT_RUNTIME_ARN = os.environ["AGENTCORE_RUNTIME_ARN"]
+S3_BUCKET         = os.environ["AGENTCORE_S3_BUCKET"]
+EXP_ID            = os.environ.get("AGENTCORE_EXP_ID", f"slime-{uuid4().hex[:8]}")
+MAX_CONCURRENT    = int(os.environ.get("AGENTCORE_MAX_CONCURRENT", "50"))
+
+def build_rollout_client() -> RolloutClient:
+    return RolloutClient(
+        agent_runtime_arn=AGENT_RUNTIME_ARN,
+        s3_bucket=S3_BUCKET,
+        exp_id=EXP_ID,
+        tps_limit=25,
+        max_pool_connections=max(MAX_CONCURRENT, 10),
+    )
+```
+
+`RolloutClient` 本身管理并发、限流、指数退避轮询 S3——这些原来需要 DockerSandbox 手动实现的逻辑全部由 AgentCore 提供。
+
+---
+
+## 六、Component D：奖励函数
+
+奖励由 AgentCore 内的 `agentcore_rl.py` 在沙箱执行完毕后立即计算，写入 S3 结果：
+
+```json
+{ "rewards": 0.72, "reward_breakdown": {"r_task": 1.0, "r_quality_det": 0.44, ...} }
+```
+
+`custom_generate` 直接从 `s3_result["rewards"]` 取值，**无需在训练集群重复计算奖励**。
+
+奖励权重通过 AgentCore Runtime 的容器环境变量控制（部署时配置）：
+```
+REWARD_WEIGHT_TASK=1.0
+REWARD_WEIGHT_QUALITY_DET=0.5
+REWARD_WEIGHT_QUALITY_LLM=0.0
+REWARD_WEIGHT_COST=0.0          # 训练时不惩罚 token 成本
+```
+
+`custom_generate` 返回前预填 `sample.reward`，`sglang_rollout.py:297` 的 `if sample.reward is None` 判断会跳过 RM 调用，不需要设置 `--rm-type`。
+
+---
+
+## 七、Component E：数据集格式（`dataset.py`）
+
+**输入**：harness 原生任务格式（SWE-bench 或内部 bug 库），与 `collect_rollouts.py` 格式完全相同：
+
+```jsonl
+{
+  "instance_id": "django__django-1234",
+  "config": {
+    "problem_statement": "Fix the issue where...",
+    "base_commit": "abc123",
+    "test_patch": "diff --git ...",
+    "max_steps": 50
+  },
+  "env_vars": { "GITHUB_TOKEN": "..." }
+}
+```
+
+**输出**：slime JSONL（`--prompt-data` 参数）。`config` 和 `env_vars` 原样嵌入 metadata，`rollout_fn.py` 直接透传给 AgentCore——评估由 harness 内部处理，不需要单独的 `eval_cmd` 字段：
+
+```jsonl
+{
+  "prompt": "Fix the issue where...",
+  "label": "django__django-1234",
+  "metadata": {
+    "instance_id": "django__django-1234",
+    "config": {
+      "problem_statement": "Fix the issue where...",
+      "base_commit": "abc123",
+      "test_patch": "diff --git ...",
+      "max_steps": 50
+    },
+    "env_vars": { "GITHUB_TOKEN": "..." }
+  }
+}
+```
+
+转换命令：
+
+```bash
+python examples/harness_rl/dataset.py \
+    --input /data/swebench_tasks.jsonl \
+    --output /data/slime_tasks.jsonl
+```
+
+---
+
+## 八、AWS AgentCore 详解与集成要点
+
+### 8.1 AgentCore 是什么
+
+Amazon Bedrock AgentCore 是 AWS 的托管 agent 执行平台，核心是 **Runtime**：
+
+- **microVM 隔离**：每个 session 独立 microVM，真正的沙箱隔离
+- **自动扩缩容**：按需启动，最多支持 1000 个并发 session（可申请提升）
+- **长运行支持**：单个 session 最长 8 小时（适合复杂编程任务）
+- **无服务器**：无需管理 Docker 集群，按用量计费
+
+### 8.2 RL Toolkit（`agentcore-rl-toolkit`）
+
+`agentcore-rl-toolkit` 是 AWS 开源的 SDK，专为 RL 训练设计：
+
+| 组件 | 位置 | 作用 |
+|---|---|---|
+| `AgentCoreRLApp` | agent 容器内 | 替换 `BedrockAgentCoreApp`，`@rollout_entrypoint` 让 agent 后台执行并自动保存结果到 S3 |
+| `RolloutClient` | 训练客户端 | 批量提交 rollout、管理并发、轮询 S3 结果 |
+| `RolloutFuture` | 训练客户端 | 单个 rollout 的 future，`result_async(timeout=...)` 等待 S3 结果 |
+
+**harness 已有的 RL 集成**（`src/services/sandbox/agentcore_rl.py`）：
+```python
+@app.rollout_entrypoint
+def invoke_agent(payload: dict) -> dict:
+    # 1. 从 payload["env_vars"] 设置环境变量（包括 QWEN36_27B_API_BASE）
+    # 2. 调用 run_cloud()（harness agent 主循环）
+    # 3. 计算 reward_breakdown（compose_reward）
+    # 4. 返回 {"rewards": float, "reward_breakdown": dict, "result": dict}
+    # → @rollout_entrypoint 自动将返回值保存到 S3
+```
+
+### 8.3 session_id 传递机制
+
+```
+rollout_fn.py                    AgentCore microVM
+  session_id = "cagent-xxx"
+  payload["env_vars"] = {
+    "QWEN36_27B_API_KEY": session_id  ──→  env var in harness process
+  }                                         ↓
+                                   harness LiteLLM call:
+                                     api_key = QWEN36_27B_API_KEY = session_id
+                                     → Authorization: Bearer cagent-xxx
+                                         ↓ HTTP
+                              shim.py（训练集群）
+                              提取 Bearer token = session_id
+                              → 关联到正确的 TurnRecord 列表
+```
+
+### 8.4 网络连通性（训练在 AWS EC2 上）
+
+训练在 EC2 上进行，与 AgentCore Runtime 同在 AWS 网络内，连通性最简单：
+
+```
+EC2（slime 训练 + shim）
+    └── VPC 私有子网
+         ↕ 同 VPC 或 VPC Peering（内网，无需公网）
+AgentCore Runtime（microVM）
+         ↕ 同 Region
+S3（rollout 结果）
+```
+
+**配置要点**：
+- `SHIM_PUBLIC_URL` 设为 EC2 实例的**私有 IP**（或内网 DNS），不需要公网 IP
+- Security Group：EC2 的 shim 端口（默认 18001）允许来自 AgentCore 的 VPC 流量入站
+- IAM：EC2 实例角色授予 `bedrock-agentcore:InvokeAgentRuntime` 和 `s3:GetObject/PutObject` 权限
+- 建议 EC2 和 AgentCore Runtime 在同一 AWS Region，降低延迟并避免跨区域数据传输费用
+
+### 8.5 并发控制
+
+AgentCore 默认账号限制 1000 个并发 session。`RolloutClient(max_concurrent_sessions=N)` 控制并发上限。建议与 slime 的 `--rollout-batch-size` 对齐：
+
+```
+--rollout-batch-size 32 --n-samples-per-prompt 4
+→ 同时最多 32×4 = 128 个 AgentCore session
+→ AGENTCORE_MAX_CONCURRENT=128
+```
+
+---
+
+## 九、多节点 EC2 训练配置
+
+### 9.1 slime 多节点机制
+
+slime 用 **Ray** 做跨节点调度，**Megatron** 做分布式训练，二者协同工作：
+
+```
+EC2 Head 节点（同时运行 shim）
+  └── ray start --head → Ray 集群入口
+        ├── EC2 Worker 1: ray start --address=HEAD:6379
+        ├── EC2 Worker 2: ray start --address=HEAD:6379
+        └── EC2 Worker N: ray start --address=HEAD:6379
+
+ray job submit → train.py → Ray 自动跨节点分配 GPU bundles → Megatron 接管分布式训练
+```
+
+slime 的 `placement_group.py` 会跨节点收集所有 GPU（按节点 IP + GPU 编号排序），统一分配给 Megatron actor。Megatron 负责跨节点的 TP/PP/CP 并行通信（NCCL over EFA/InfiniBand）。
+
+### 9.2 Qwen3-27B 并行策略（4节点 × 8×H100）
+
+| 参数 | 值 | 说明 |
+|---|---|---|
+| `--actor-num-nodes` | 4 | EC2 节点数 |
+| `--actor-num-gpus-per-node` | 8 | 每节点 GPU 数 |
+| `--tensor-model-parallel-size` | 4 | 节点内 TP（NVLink）|
+| `--pipeline-model-parallel-size` | 2 | 跨节点 PP（EFA）|
+| `--context-parallel-size` | 4 | 长序列 CP（可选）|
+| `--rollout-num-gpus-per-engine` | 4 | 每个 SGLang 引擎使用的 GPU 数 |
+
+总训练 GPU：4×8=32 张；TP=4×PP=2=8 张一组，共 4 组数据并行。
+
+### 9.3 启动脚本（`launch.sh`）
+
+沙箱相关配置通过**环境变量**传入（slime 的 argument parser 不接受未定义参数）：
+
+```bash
+#!/bin/bash
+set -ex
+
+# ── 必填：节点配置 ──────────────────────────────────────────
+export MASTER_ADDR=<Head节点私有IP>
+export ACTOR_NUM_NODES=4
+export ACTOR_NUM_GPUS_PER_NODE=8
+export HOSTFILE=/root/hostfile   # 每行一个 Worker 节点私有 IP
+
+# ── 必填：AgentCore / shim（通过环境变量，不是 CLI 参数）──
+export SHIM_PUBLIC_URL=http://${MASTER_ADDR}:18001  # AgentCore microVM 访问 shim 的地址（VPC 内网）
+export SHIM_PORT=18001
+export AGENTCORE_RUNTIME_ARN=arn:aws:bedrock-agentcore:us-west-2:...:runtime/...
+export AGENTCORE_S3_BUCKET=your-rollout-bucket
+export AGENTCORE_EXP_ID=corepass-run-01
+export AGENTCORE_MAX_CONCURRENT=128   # 对齐 rollout-batch-size × n-samples-per-prompt
+export SWE_TIME_BUDGET_SEC=600
+
+# ── 网络：关闭代理，避免 Ray/NCCL 通信异常 ────────────────
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
+export no_proxy="127.0.0.1,${MASTER_ADDR}"
+
+# ── Step 1：启动 Ray Head ──────────────────────────────────
+ray stop --force; ray start --head \
+    --node-ip-address "${MASTER_ADDR}" \
+    --num-gpus "${ACTOR_NUM_GPUS_PER_NODE}" \
+    --dashboard-host=0.0.0.0 --dashboard-port=8265
+
+# ── Step 2：SSH 启动所有 Worker 节点 ──────────────────────
+for WORKER_IP in $(awk '{print $1}' "${HOSTFILE}"); do
+    [[ "${WORKER_IP}" == "${MASTER_ADDR}" ]] && continue
+    ssh root@"${WORKER_IP}" \
+      "ray stop --force; ray start \
+        --address=${MASTER_ADDR}:6379 \
+        --num-gpus ${ACTOR_NUM_GPUS_PER_NODE} \
+        --node-ip-address ${WORKER_IP}" &
+done
+wait
+
+# ── Step 3：提交训练任务 ───────────────────────────────────
+RUNTIME_ENV_JSON=$(cat <<EOF
+{
+  "env_vars": {
+    "MASTER_ADDR": "${MASTER_ADDR}",
+    "GLOO_SOCKET_IFNAME": "eth0",
+    "NCCL_SOCKET_IFNAME": "eth0",
+    "PYTHONPATH": "/root/Megatron-LM/",
+    "CUDA_DEVICE_MAX_CONNECTIONS": "1",
+    "SHIM_PUBLIC_URL": "${SHIM_PUBLIC_URL}",
+    "SHIM_PORT": "${SHIM_PORT}",
+    "AGENTCORE_RUNTIME_ARN": "${AGENTCORE_RUNTIME_ARN}",
+    "AGENTCORE_S3_BUCKET": "${AGENTCORE_S3_BUCKET}",
+    "AGENTCORE_EXP_ID": "${AGENTCORE_EXP_ID}",
+    "AGENTCORE_MAX_CONCURRENT": "${AGENTCORE_MAX_CONCURRENT}",
+    "SWE_TIME_BUDGET_SEC": "${SWE_TIME_BUDGET_SEC}"
+  }
+}
+EOF
+)
+
+ray job submit --address="http://127.0.0.1:8265" \
+  --runtime-env-json="${RUNTIME_ENV_JSON}" \
+  -- python3 train.py \
+  --actor-num-nodes "${ACTOR_NUM_NODES}" \
+  --actor-num-gpus-per-node "${ACTOR_NUM_GPUS_PER_NODE}" \
+  \
+  --hf-checkpoint /root/models/Qwen3-27B/ \
+  --ref-load /root/models/Qwen3-27B_torch_dist/ \
+  --megatron-model-type qwen3-27b \
+  --tensor-model-parallel-size 4 \
+  --pipeline-model-parallel-size 2 \
+  --context-parallel-size 4 \
+  --sequence-parallel \
+  \
+  --prompt-data /data/slime_tasks.jsonl \
+  --input-key prompt \
+  --label-key label \
+  --apply-chat-template \
+  \
+  --custom-generate-function-path examples.harness_rl.rollout_fn.custom_generate \
+  \
+  --advantage-estimator grpo \
+  --use-kl-loss \
+  --kl-loss-coef 0.01 \
+  --eps-clip 0.2 \
+  --eps-clip-high 0.28 \
+  \
+  --num-rollout 500 \
+  --rollout-batch-size 32 \
+  --n-samples-per-prompt 4 \
+  --rollout-max-response-len 8192 \
+  --rollout-temperature 0.8 \
+  --global-batch-size 32 \
+  --rollout-num-gpus-per-engine 4 \
+  \
+  --save-interval 50 \
+  --eval-interval 50 \
+  --eval-prompt-data /data/swebench_test.jsonl
+```
+
+`--n-samples-per-prompt 4`：GRPO 对同一任务采样 4 条轨迹，用 4 条间的相对奖励计算 advantage。`AGENTCORE_MAX_CONCURRENT=128` 与 `32×4=128` 对齐，确保 AWS 并发资源不浪费也不超限。
+
+---
+
+## 十、评估循环
+
+**方式一：slime 内置 eval**
+
+每 50 步自动跑 eval（已在 launch.sh 中配置）：
+
+```bash
+--eval-interval 50 \
+--eval-prompt-data /data/swebench_test.jsonl
+```
+
+**方式二：直接用 harness 的 bench.py**
+
+把训练好的 checkpoint 转回 HF 格式，启动 SGLang 服务，然后：
+
+```bash
+MODEL=openai/qwen3.6-27b \
+QWEN36_27B_API_BASE=http://localhost:8000/v1 \
+python bench.py --dataset swebench_verified --n 50
+```
+
+可直接得到 resolved rate，与同等规模商业模型横向对比。
+
+---
+
+## 十一、长期兼容策略
+
+### 11.1 对 slime 更新的兼容
+
+我们只依赖 slime 的**公开 customization 接口**：
+
+| 依赖点 | 位置 | 稳定性 | 策略 |
+|---|---|---|---|
+| `custom_generate` 签名 | `sglang_rollout.py:267-275` | 高（公开 API） | 无风险 |
+| `Sample` 字段及 `sample.reward` 预填跳过 RM | `sglang_rollout.py:297-300` | 高（向后兼容） | 无风险 |
+| `args.sglang_router_ip/port` 自动注入 | slime 启动时设置 | 高 | 无风险 |
+| 每步 `update_weights()` 同步到 SGLang | `train.py:93` | 高（核心机制） | 无风险 |
+| `TurnRecord`, `merge_turns` | `slime/agent/trajectory.py` | 中（内部但稳定） | slime 更新时跑 `test_agent_trajectory.py` 验证 |
+| `fan_out_sample_segments` | `slime/agent/trajectory.py` | 中 | 同上 |
+
+操作：用 git submodule 把 slime 锁定版本，按需升级。
+
+### 11.2 对 harness 更新的兼容
+
+**我们依赖 harness 的唯一合约**：
+
+> harness 调用 `QWEN36_27B_API_BASE` 指向的 OpenAI `/v1/chat/completions` 端点
+
+只要 harness 继续用 LiteLLM 发 HTTP 请求，shim 完全不受 harness 内部变动影响（工具改了、消息格式变了、新增功能……都无所谓）。
+
+风险点：
+
+| harness 变化 | 影响 | 应对 |
+|---|---|---|
+| 删除 `QWEN36_27B_API_BASE` 支持 | 高 | PR 给 harness 加一个通用 `CUSTOM_API_BASE` 机制（一行改动）|
+| 切换 LiteLLM → 其他 HTTP 客户端 | 中 | 只要还用 Bearer token，shim 不需改；若换认证方式则改 shim 的 session_id 提取逻辑 |
+| tools schema 格式大变 | 低 | 更新 `HARNESS_TOOLS_SCHEMA` 常量 |
+
+操作：把 `simple-coding-harness` 作为 git submodule 管理，Docker 镜像里锁定版本；harness 有重大更新时，先跑 smoke test（单任务走完全流程）再升级。
+
+### 11.3 双向更新流程
+
+```
+slime 有新版本：
+  1. 跑 tests/test_agent_trajectory.py
+  2. 跑 shim 的 smoke test（单任务端到端）
+  3. 通过 → 升级 slime submodule
+
+harness 有新版本：
+  1. 检查 src/query/model_routes.py 是否变动
+  2. 跑单任务端到端 smoke test
+  3. 通过 → 升级 harness submodule
+  4. 重新 build Docker 训练镜像
+```
+
+### 11.4 接口隔离图
+
+```
+examples/harness_rl/
+├── shim.py              ← 只依赖 slime.agent.{trajectory,parsing}（内部稳定）
+│                           + SGLang /generate API（sglang 稳定）
+├── rollout_fn.py        ← 只依赖 slime 公开 custom_generate 接口
+│                           + agentcore_client.py（自控）
+├── agentcore_client.py  ← 只依赖 agentcore-rl-toolkit RolloutClient（AWS SDK，稳定）
+│                           + 环境变量（AGENTCORE_RUNTIME_ARN 等）
+└── dataset.py           ← 无运行时依赖，仅格式转换
+```
+
+奖励计算在 AgentCore 容器内由 harness 处理，训练集群侧无 reward 依赖。
+
+---
+
+## 十二、核心风险与对策
+
+| 风险 | 概率 | 对策 |
+|---|---|---|
+| 奖励太稀疏（resolved rate < 5%） | 中 | 先用 `r_quality_det`（连续，只要有测试通过就有信号）；用更简单的任务集暖启动 |
+| AgentCore 并发/配额不足 | 低 | 默认 1000 session；`AGENTCORE_MAX_CONCURRENT` 控制上限；超量可申请提升 |
+| Qwen3-27B 显存不足 | 低 | TP=4（4×H100），必要时开 FP8 rollout（slime 已支持）|
+| shim 的 wipe 检测误判 | 低 | V1 可以先不检测 wipe，只损失压缩后的段不参与训练，不影响正确性 |
+
+---
+
+## 十三、推进路线
+
+```
+第 1 周：环境 + 连通性验证
+  ├── 搭建 Qwen3-4B 的 slime 训练环境（验证 Megatron+SGLang 能跑）
+  ├── 验证 AgentCore Runtime 已部署（setup_agentcore_runtime.py 已跑通）
+  ├── 验证 shim（训练集群）← AgentCore microVM 的网络连通性
+  └── 转换 100 条 SWE-bench 任务为 slime JSONL 格式
+
+第 2 周：shim + rollout_fn（关键）
+  ├── 实现 shim.py（重点：SGLang /generate + TurnRecord 记录）
+  ├── 实现 rollout_fn.py（RolloutClient.invoke_async + pop_session_split）
+  ├── Smoke test：单条任务完整跑通
+  │   验证：shim 收到 AgentCore 发来的 /v1/chat/completions 请求
+  │   验证：S3 结果中有 rewards 字段
+  │   验证：TurnRecord 的 loss_mask 和 log_probs 正确
+  └── 验证 reward 非零（用简单任务，confirm resolved rate > 0）
+
+第 3 周：扩到 Qwen3-27B + 正式训练
+  ├── 下载 Qwen3-27B，转 Megatron 格式
+  ├── 调 rollout-batch-size / AGENTCORE_MAX_CONCURRENT / n_samples_per_prompt
+  └── 跑第一个 100-step 训练，验证 reward 有上升趋势
+
+第 4 周+：迭代
+  ├── 用 bench.py 测 resolved rate（模型转回 HF 格式后直接测）
+  ├── 调整奖励权重（quality_det vs task）
+  └── 增加训练任务多样性（内部 bug 库 + SWE-bench）
+```
+
+---
+
+## 附：相关项目路径
+
+| 路径（相对于各自仓库根目录） | 说明 |
+|---|---|
+| `examples/coding_agent_rl/` | slime 参考实现（Claude Code + E2B + Anthropic API）|
+| `slime/agent/trajectory.py` | TurnRecord / TokenSegment / merge_turns（直接复用）|
+| `slime/agent/parsing.py` | 模型输出解析（直接复用）|
+| `src/query/model_routes.py` | harness：Qwen3.6-27B 路由配置（核心集成点）|
+| `rl_data/grpo/reward.py` | harness：奖励函数（AgentCore 内部调用）|
+| `src/services/sandbox/agentcore_rl.py` | harness：AgentCore RL entrypoint（已有实现）|
+| `rl_data/collect_rollouts.py` | harness：`RolloutClient` 用法参考模板 |
+| `scripts/setup_agentcore_runtime.py` | harness：AgentCore Runtime 部署脚本 |
+| `https://github.com/awslabs/agentcore-rl-toolkit` | AgentCore RL Toolkit 开源 SDK |
