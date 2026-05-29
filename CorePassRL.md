@@ -6,7 +6,12 @@
 
 **权重同步机制**（来自 `train.py:93`）：每个 rollout_id 循环末尾都执行 `actor_model.update_weights()`，把 Megatron 最新训练权重同步到 SGLang 推理引擎。因此每轮"生成→训练→生成→训练"循环中，下一轮生成用的就是当前最新的模型权重。
 
-**关键发现**：simple-coding-harness 里已经有 `QWEN36_27B_API_BASE` / `QWEN36_27B_API_KEY` 这两个环境变量，专门为本地 Qwen3.6-27B 服务设计。`api_key` 会被 LiteLLM 作为 `Authorization: Bearer {key}` 发出——这和 `coding_agent_rl` 里把 session_id 塞进 `ANTHROPIC_AUTH_TOKEN` 的机制完全相同。
+**模型命名说明**：
+- **Qwen3.5-27B**：slime 已有完整支持（`--spec slime_plugins.models.qwen3_5`），本文档以此为例
+- **Qwen3.6-27B**：harness 中 `model_routes.py` 使用的模型路由标识符（`openai/qwen3.6-27b`），仅是 API 路由名称，不代表具体模型版本；实际指向我们的 shim，shim 转发给 slime 管理的 SGLang（运行 Qwen3.5-27B 权重）
+- 实际训练的基础模型权重为 **Qwen3.5-27B**
+
+**关键发现**：simple-coding-harness 里已经有 `QWEN36_27B_API_BASE` / `QWEN36_27B_API_KEY` 这两个环境变量，专门为指向本地推理服务设计。`api_key` 会被 LiteLLM 作为 `Authorization: Bearer {key}` 发出——这和 `coding_agent_rl` 里把 session_id 塞进 `ANTHROPIC_AUTH_TOKEN` 的机制完全相同。
 
 因此集成点极为干净：**不需要修改两个项目的任何一行代码**。
 
@@ -515,7 +520,9 @@ RUNTIME_ENV_JSON=$(cat <<EOF
   "env_vars": {
     "MASTER_ADDR": "${MASTER_ADDR}",
     "GLOO_SOCKET_IFNAME": "eth0",
-    "NCCL_SOCKET_IFNAME": "eth0",
+    "NCCL_SOCKET_IFNAME": "efa0",
+    "FI_PROVIDER": "efa",
+    "FI_EFA_USE_DEVICE_RDMA": "1",
     "PYTHONPATH": "/root/Megatron-LM/",
     "CUDA_DEVICE_MAX_CONNECTIONS": "1",
     "SHIM_PUBLIC_URL": "${SHIM_PUBLIC_URL}",
@@ -579,6 +586,7 @@ ray job submit --address="http://127.0.0.1:8265" \
   --prompt-data /data/slime_tasks.jsonl \
   --input-key prompt --label-key label \
   --apply-chat-template --rollout-shuffle \
+  --balance-data \
   \
   # ── 集成入口 ────────────────────────────────────────────────
   --custom-generate-function-path examples.harness_rl.rollout_fn.custom_generate \
@@ -591,17 +599,19 @@ ray job submit --address="http://127.0.0.1:8265" \
   \
   # ── GRPO ────────────────────────────────────────────────────
   --advantage-estimator grpo \
-  --use-kl-loss --kl-loss-coef 0.00 \
-  --kl-loss-type low_var_kl \
+  --kl-coef 0.00 \
+  --kl-loss-coef 0.00 --kl-loss-type low_var_kl \
   --eps-clip 0.2 --eps-clip-high 0.28 \
   \
   # ── Rollout ─────────────────────────────────────────────────
+  # global-batch-size 必须 = rollout-batch-size × n-samples-per-prompt
+  # 32 × 4 = 128；若想用 256 需把 rollout-batch-size 改为 64
   --num-rollout 500 \
   --rollout-batch-size 32 \
   --n-samples-per-prompt 4 \
   --rollout-max-response-len 8192 \
   --rollout-temperature 1.0 \
-  --global-batch-size 256 \
+  --global-batch-size 128 \
   \
   # ── 保存与评估 ───────────────────────────────────────────────
   --save-interval 50 \
@@ -611,19 +621,22 @@ ray job submit --address="http://127.0.0.1:8265" \
 
 关键参数说明：
 
-| 参数 | 原值 | 修正后 | 原因 |
-|---|---|---|---|
-| 入口 | `train.py` | `train_async.py` | 长尾任务：训练与下一轮 rollout 重叠，减少 GPU 空转 |
-| `--colocate` | 未设 | 添加 | 32 张 GPU 全给训练，没有 GPU 剩余给 SGLang |
-| `--spec` | `--megatron-model-type qwen3-27b`（不存在）| `--spec slime_plugins...` | 模型通过 `--spec` + 架构参数指定，不存在单一 model-type flag |
-| `--recompute-*` | 未设 | 添加 | 激活重计算，~40% 显存节省 |
-| `--calculate-per-token-loss` | 未设 | 添加 | GRPO 变长序列正确 loss 归一化 |
-| `--optimizer-cpu-offload` | 未设 | 添加 | 27B 模型优化器状态 offload 到 CPU |
-| `--dynamic-sampling-filter-path` | 未设 | 添加 | 过滤全零方差组，节省无效训练步 |
-| `--sglang-tool-call-parser` | 未设 | `qwen25` | Qwen3 工具调用解析 |
-| `--global-batch-size` | 32 | 256 | 与参考脚本对齐；32 太小，梯度噪声大 |
-| `--rollout-temperature` | 0.8 | 1.0 | 编程任务需要更多探索（参考脚本值）|
-| `--kl-loss-coef` | 0.01 | 0.00 | 早期训练不加 KL 惩罚，让模型自由探索 |
+| 参数 | 值 | 原因 |
+|---|---|---|
+| 入口 `train_async.py` | — | 长尾任务：训练与下一轮 rollout 重叠，减少 GPU 空转 |
+| `--colocate` | 添加 | 32 张 GPU 全给训练，没有 GPU 剩余给 SGLang |
+| `--spec` | `slime_plugins.models.qwen3_5` | 模型通过 `--spec` + 架构参数指定，不存在单一 model-type flag |
+| `--balance-data` | 添加 | 平衡各 DP rank 的序列长度，避免长序列节点成为瓶颈 |
+| `--recompute-*` | 添加 | 激活重计算，~40% 显存节省 |
+| `--calculate-per-token-loss` | 添加 | GRPO 变长序列正确 loss 归一化 |
+| `--optimizer-cpu-offload` | 添加 | 27B 优化器状态 offload 到 CPU |
+| `--dynamic-sampling-filter-path` | 添加 | 过滤全零方差组（全失败或全成功），节省无效训练步 |
+| `--sglang-tool-call-parser qwen25` | 添加 | Qwen3 工具调用格式解析 |
+| `--global-batch-size` | 128 | 必须 = rollout_batch_size(32) × n_samples(4)；256 会超出单轮 rollout 的样本数 |
+| `--rollout-temperature` | 1.0 | 编程任务需要更多探索 |
+| `--kl-coef 0.00` + `--kl-loss-coef 0.00` | 双零 | 早期训练不加 KL 惩罚；二者互斥，参考脚本均设 0 |
+| `--load` | 与 `--save` 相同 | 断点续训；若 `--load` 路径无 checkpoint 会自动 fallback 到 `--ref-load` |
+| `FI_PROVIDER=efa` + `FI_EFA_USE_DEVICE_RDMA=1` | 添加 | EC2 多节点训练启用 EFA RDMA，跨节点通信提速 5-10× |
 
 ---
 
@@ -652,7 +665,48 @@ python bench.py --dataset swebench_verified --n 50
 
 ---
 
-## 十一、长期兼容策略
+## 十一、运营与成本估算
+
+### 11.1 AWS 成本概估（500 rollout，4× p4de.24xlarge）
+
+| 资源 | 计算 | 金额（On-demand） | 金额（Spot ~70% off）|
+|---|---|---|---|
+| EC2（4× p4de.24xlarge @~$32.8/hr）| ~80h（500轮 × 580s/轮）| ~$10,500 | ~$3,200 |
+| AgentCore Runtime | 500×128 session × 200s_avg | ~$214 | ~$214 |
+| S3 存储/传输 | rollout 结果 + checkpoint | ~$20 | ~$20 |
+| **合计** | | **~$10,700** | **~$3,400** |
+
+**建议**：先用 Spot 实例跑 50~100 rollout 的探索实验（~$340-680），验证 reward 有上升趋势后再扩到完整训练。p4de.24xlarge Spot 中断率相对较低，配合 `--save-interval 50` 可安全恢复。
+
+### 11.2 数据集规模与多样性
+
+**SWE-bench 的局限**：
+- SWE-bench verified：~500 个任务，rollout_batch=32 × 500轮 = 一个数据集多次重复
+- 同一任务反复出现 → 模型过拟合特定 repo/语言，而非泛化编程能力
+
+**建议的数据混合策略**：
+
+| 数据来源 | 规模 | 价值 |
+|---|---|---|
+| SWE-bench verified | ~500 | 标准 benchmark，便于横向对比 |
+| 内部 bug 修复记录 | 按需 | 贴合实际业务场景 |
+| SWE-bench-extra / open-source issues | ~2000+ | 更多任务多样性 |
+
+简单任务（resolved rate > 20%）先暖启动，再引入困难任务，避免早期全零奖励。
+
+### 11.3 n_samples_per_prompt 的成本效益
+
+每个 AgentCore session 约 200s、成本约 $0.003。
+
+| n_samples | 每任务成本 | GRPO 信号 | 建议 |
+|---|---|---|---|
+| 2 | ~$0.006 | 较弱（方差低）| 预算紧张时 |
+| 4 | ~$0.012 | 均衡 | **推荐起始值** |
+| 8 | ~$0.024 | 充足 | 验证有效后扩大 |
+
+---
+
+## 十二、长期兼容策略
 
 ### 11.1 对 slime 更新的兼容
 
@@ -719,7 +773,7 @@ examples/harness_rl/
 
 ---
 
-## 十二、核心风险与对策
+## 十三、核心风险与对策
 
 | 风险 | 概率 | 对策 |
 |---|---|---|
@@ -730,7 +784,7 @@ examples/harness_rl/
 
 ---
 
-## 十三、推进路线
+## 十四、推进路线
 
 ```
 第 1 周：环境 + 连通性验证
