@@ -177,6 +177,9 @@ async def custom_generate(args, sample, sampling_params):
     state = _State.get(args)          # 单例：初始化 tokenizer + shim + AgentCore client
 
     session_id = f"cagent-{sample.index}-{sample.group_index}-{secrets.token_hex(4)}"
+    # HARNESS_TOOLS_SCHEMA：从 harness 的工具注册表导出的 OpenAI 格式 schema，
+    # 供 shim 在 apply_chat_template 时注入工具定义，使模型输出合法的工具调用格式。
+    # 初始化时调用：from src.tools import all_tools_openai; HARNESS_TOOLS_SCHEMA = all_tools_openai()
     open_session(state.store, session_id,
                  tokenizer=state.tokenizer,
                  tools_schema=HARNESS_TOOLS_SCHEMA,
@@ -397,7 +400,26 @@ S3（rollout 结果）
 - IAM：EC2 实例角色授予 `bedrock-agentcore:InvokeAgentRuntime` 和 `s3:GetObject/PutObject` 权限
 - 建议 EC2 和 AgentCore Runtime 在同一 AWS Region，降低延迟并避免跨区域数据传输费用
 
-### 8.5 并发控制
+### 8.5 长尾任务与训练效率
+
+SWE 任务执行时间分布极不均匀（10s ~ 600s），直接影响 GPU 利用率：
+
+```
+标准 train.py：
+  rollout_batch = 128 个任务并发提交给 AgentCore
+  → 等待最慢那个（P95 ≈ 580s）才能开始训练
+  → 大部分 GPU 在 P50~P95 这段时间（约 460s）空转
+  GPU 利用率 ≈ P50/P95 ≈ 120/580 ≈ 20%
+
+train_async.py（本方案）：
+  rollout N+1 在训练 rollout N 时已提前启动
+  → 训练结束后大概率 rollout 已就绪
+  GPU 利用率显著提升，但仍受最慢样本影响
+```
+
+进一步优化（V2）：使用 `--rollout-function-path slime.rollout.fully_async_rollout.generate_rollout_fully_async`，维持固定大小的 in-flight 任务池，训练步只取已完成的样本，彻底消除等待长尾的问题。适合稳定后的大规模训练。
+
+### 8.6 并发控制
 
 AgentCore 默认账号限制 1000 个并发 session。`RolloutClient(max_concurrent_sessions=N)` 控制并发上限。建议与 slime 的 `--rollout-batch-size` 对齐：
 
@@ -427,18 +449,21 @@ ray job submit → train.py → Ray 自动跨节点分配 GPU bundles → Megatr
 
 slime 的 `placement_group.py` 会跨节点收集所有 GPU（按节点 IP + GPU 编号排序），统一分配给 Megatron actor。Megatron 负责跨节点的 TP/PP/CP 并行通信（NCCL over EFA/InfiniBand）。
 
-### 9.2 Qwen3-27B 并行策略（4节点 × 8×H100）
+### 9.2 Qwen3.5-27B（或 Qwen3.6-27B）并行策略（4节点 × 8×H100，colocate 模式）
+
+**GPU 分配**：4×8=32 张，全部同时用于训练和推理（`--colocate` 时间复用）。
 
 | 参数 | 值 | 说明 |
 |---|---|---|
 | `--actor-num-nodes` | 4 | EC2 节点数 |
 | `--actor-num-gpus-per-node` | 8 | 每节点 GPU 数 |
+| `--colocate` | 开启 | 训练与 SGLang 推理共用同一批 GPU（时间复用），无需额外推理节点 |
 | `--tensor-model-parallel-size` | 4 | 节点内 TP（NVLink）|
 | `--pipeline-model-parallel-size` | 2 | 跨节点 PP（EFA）|
-| `--context-parallel-size` | 4 | 长序列 CP（可选）|
-| `--rollout-num-gpus-per-engine` | 4 | 每个 SGLang 引擎使用的 GPU 数 |
+| `--context-parallel-size` | 4 | 长序列 CP |
+| `--rollout-num-gpus-per-engine` | 2 | colocate 模式下每个 SGLang 引擎 2 张 GPU（参考 run-qwen3.5-27B.sh）|
 
-总训练 GPU：4×8=32 张；TP=4×PP=2=8 张一组，共 4 组数据并行。
+TP=4×PP=2=8 张一组，共 4 组数据并行。colocate 模式下训练完成后 SGLang 接管同一批 GPU 做推理，再同步权重后进入下一轮训练。
 
 ### 9.3 启动脚本（`launch.sh`）
 
@@ -505,47 +530,100 @@ RUNTIME_ENV_JSON=$(cat <<EOF
 EOF
 )
 
+# ── 前置步骤：需提前把 HF checkpoint 转换为 torch_dist 格式 ──
+# python tools/convert_hf_to_torch_dist.py \
+#     --hf-checkpoint /root/models/Qwen3.5-27B \
+#     --output /root/models/Qwen3.5-27B_torch_dist
+
 ray job submit --address="http://127.0.0.1:8265" \
   --runtime-env-json="${RUNTIME_ENV_JSON}" \
-  -- python3 train.py \
+  -- python3 train_async.py \
   --actor-num-nodes "${ACTOR_NUM_NODES}" \
   --actor-num-gpus-per-node "${ACTOR_NUM_GPUS_PER_NODE}" \
+  --colocate \
   \
-  --hf-checkpoint /root/models/Qwen3-27B/ \
-  --ref-load /root/models/Qwen3-27B_torch_dist/ \
-  --megatron-model-type qwen3-27b \
+  # ── 模型架构（以 Qwen3.5-27B 为例；Qwen3.6-27B 需替换 spec）──
+  --spec "slime_plugins.models.qwen3_5" "get_qwen3_5_spec" \
+  --num-layers 64 --hidden-size 5120 --ffn-hidden-size 17408 \
+  --num-attention-heads 24 --num-query-groups 4 --kv-channels 256 \
+  --vocab-size 248320 --swiglu --qk-layernorm --disable-bias-linear \
+  --normalization RMSNorm --norm-epsilon 1e-6 \
+  --position-embedding-type rope --rotary-percent 0.25 --rotary-base 10000000 \
+  --untie-embeddings-and-output-weights --attention-output-gate \
+  \
+  # ── 检查点 ──────────────────────────────────────────────────
+  --hf-checkpoint /root/models/Qwen3.5-27B/ \
+  --ref-load /root/models/Qwen3.5-27B_torch_dist/ \
+  --load /root/models/Qwen3.5-27B_slime/ \
+  --save /root/models/Qwen3.5-27B_slime/ \
+  \
+  # ── 并行策略 ────────────────────────────────────────────────
   --tensor-model-parallel-size 4 \
   --pipeline-model-parallel-size 2 \
   --context-parallel-size 4 \
   --sequence-parallel \
   \
+  # ── 内存与效率（来自 run-qwen3.5-27B.sh 的生产配置）────────
+  --recompute-granularity full --recompute-method uniform --recompute-num-layers 1 \
+  --use-dynamic-batch-size --max-tokens-per-gpu 8192 \
+  --calculate-per-token-loss \
+  --optimizer-cpu-offload --overlap-cpu-optimizer-d2h-h2d \
+  --use-precision-aware-optimizer \
+  --optimizer adam --lr 1e-6 --lr-decay-style constant \
+  --weight-decay 0.1 --adam-beta1 0.9 --adam-beta2 0.98 \
+  --attention-dropout 0.0 --hidden-dropout 0.0 \
+  --accumulate-allreduce-grads-in-fp32 \
+  --attention-softmax-in-fp32 --attention-backend flash \
+  \
+  # ── 数据 ────────────────────────────────────────────────────
   --prompt-data /data/slime_tasks.jsonl \
-  --input-key prompt \
-  --label-key label \
-  --apply-chat-template \
+  --input-key prompt --label-key label \
+  --apply-chat-template --rollout-shuffle \
   \
+  # ── 集成入口 ────────────────────────────────────────────────
   --custom-generate-function-path examples.harness_rl.rollout_fn.custom_generate \
+  --dynamic-sampling-filter-path \
+      slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std \
   \
+  # ── SGLang ──────────────────────────────────────────────────
+  --rollout-num-gpus-per-engine 2 \
+  --sglang-tool-call-parser qwen25 \
+  \
+  # ── GRPO ────────────────────────────────────────────────────
   --advantage-estimator grpo \
-  --use-kl-loss \
-  --kl-loss-coef 0.01 \
-  --eps-clip 0.2 \
-  --eps-clip-high 0.28 \
+  --use-kl-loss --kl-loss-coef 0.00 \
+  --kl-loss-type low_var_kl \
+  --eps-clip 0.2 --eps-clip-high 0.28 \
   \
+  # ── Rollout ─────────────────────────────────────────────────
   --num-rollout 500 \
   --rollout-batch-size 32 \
   --n-samples-per-prompt 4 \
   --rollout-max-response-len 8192 \
-  --rollout-temperature 0.8 \
-  --global-batch-size 32 \
-  --rollout-num-gpus-per-engine 4 \
+  --rollout-temperature 1.0 \
+  --global-batch-size 256 \
   \
+  # ── 保存与评估 ───────────────────────────────────────────────
   --save-interval 50 \
   --eval-interval 50 \
   --eval-prompt-data /data/swebench_test.jsonl
 ```
 
-`--n-samples-per-prompt 4`：GRPO 对同一任务采样 4 条轨迹，用 4 条间的相对奖励计算 advantage。`AGENTCORE_MAX_CONCURRENT=128` 与 `32×4=128` 对齐，确保 AWS 并发资源不浪费也不超限。
+关键参数说明：
+
+| 参数 | 原值 | 修正后 | 原因 |
+|---|---|---|---|
+| 入口 | `train.py` | `train_async.py` | 长尾任务：训练与下一轮 rollout 重叠，减少 GPU 空转 |
+| `--colocate` | 未设 | 添加 | 32 张 GPU 全给训练，没有 GPU 剩余给 SGLang |
+| `--spec` | `--megatron-model-type qwen3-27b`（不存在）| `--spec slime_plugins...` | 模型通过 `--spec` + 架构参数指定，不存在单一 model-type flag |
+| `--recompute-*` | 未设 | 添加 | 激活重计算，~40% 显存节省 |
+| `--calculate-per-token-loss` | 未设 | 添加 | GRPO 变长序列正确 loss 归一化 |
+| `--optimizer-cpu-offload` | 未设 | 添加 | 27B 模型优化器状态 offload 到 CPU |
+| `--dynamic-sampling-filter-path` | 未设 | 添加 | 过滤全零方差组，节省无效训练步 |
+| `--sglang-tool-call-parser` | 未设 | `qwen25` | Qwen3 工具调用解析 |
+| `--global-batch-size` | 32 | 256 | 与参考脚本对齐；32 太小，梯度噪声大 |
+| `--rollout-temperature` | 0.8 | 1.0 | 编程任务需要更多探索（参考脚本值）|
+| `--kl-loss-coef` | 0.01 | 0.00 | 早期训练不加 KL 惩罚，让模型自由探索 |
 
 ---
 
@@ -656,27 +734,33 @@ examples/harness_rl/
 
 ```
 第 1 周：环境 + 连通性验证
-  ├── 搭建 Qwen3-4B 的 slime 训练环境（验证 Megatron+SGLang 能跑）
+  ├── 搭建 Qwen3.5-4B 的 slime 训练环境（验证 Megatron+SGLang colocate 能跑）
   ├── 验证 AgentCore Runtime 已部署（setup_agentcore_runtime.py 已跑通）
-  ├── 验证 shim（训练集群）← AgentCore microVM 的网络连通性
+  ├── 验证 shim（EC2 Head 节点）← AgentCore microVM 的 VPC 内网连通性
   └── 转换 100 条 SWE-bench 任务为 slime JSONL 格式
 
 第 2 周：shim + rollout_fn（关键）
-  ├── 实现 shim.py（重点：SGLang /generate + TurnRecord 记录）
-  ├── 实现 rollout_fn.py（RolloutClient.invoke_async + pop_session_split）
-  ├── Smoke test：单条任务完整跑通
+  ├── 实现 shim.py（重点：SGLang /generate + TurnRecord 记录 + --sglang-tool-call-parser）
+  ├── 实现 rollout_fn.py
+  │   · HARNESS_TOOLS_SCHEMA = all_tools_openai()（从 harness 导入）
+  │   · RolloutClient.invoke_async + pop_session_split
+  │   · 超时/空 segments → ABORTED sample
+  ├── Smoke test：单条任务用 train_async.py 跑通一个完整 rollout+training step
   │   验证：shim 收到 AgentCore 发来的 /v1/chat/completions 请求
   │   验证：S3 结果中有 rewards 字段
   │   验证：TurnRecord 的 loss_mask 和 log_probs 正确
+  │   验证：dynamic_sampling_filter 过滤掉全零 reward 的组
   └── 验证 reward 非零（用简单任务，confirm resolved rate > 0）
 
-第 3 周：扩到 Qwen3-27B + 正式训练
-  ├── 下载 Qwen3-27B，转 Megatron 格式
-  ├── 调 rollout-batch-size / AGENTCORE_MAX_CONCURRENT / n_samples_per_prompt
-  └── 跑第一个 100-step 训练，验证 reward 有上升趋势
+第 3 周：扩到 Qwen3.5-27B + 正式训练
+  ├── 下载 Qwen3.5-27B HF checkpoint
+  ├── 运行 convert_hf_to_torch_dist.py 生成 _torch_dist 格式（--ref-load 用）
+  ├── 用 launch.sh 跑第一个 100-step 训练，验证 reward 有上升趋势
+  └── 监控 GPU 利用率，确认 train_async.py 的 rollout/training 重叠有效
 
-第 4 周+：迭代
-  ├── 用 bench.py 测 resolved rate（模型转回 HF 格式后直接测）
+第 4 周+：迭代与优化
+  ├── 用 bench.py 测 resolved rate（checkpoint 转回 HF 格式后直接测）
+  ├── 如 GPU 利用率仍低（< 50%），切换到 fully_async_rollout（V2）
   ├── 调整奖励权重（quality_det vs task）
   └── 增加训练任务多样性（内部 bug 库 + SWE-bench）
 ```
