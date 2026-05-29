@@ -496,7 +496,7 @@ slime 的 `placement_group.py` 会跨节点收集所有 GPU（按节点 IP + GPU
 | `--tensor-model-parallel-size` | 4 | 节点内 TP（NVLink）|
 | `--pipeline-model-parallel-size` | 2 | 跨节点 PP（EFA）|
 | `--context-parallel-size` | 4 | 长序列 CP |
-| `--rollout-num-gpus-per-engine` | 2 | colocate 模式下每个 SGLang 引擎 2 张 GPU（参考 run-qwen3.5-27B.sh）|
+| `--rollout-num-gpus-per-engine` | 2 | colocate 下每引擎 2 GPU；4 节点×8 GPU 共 16 引擎，大量并发 rollout 容量 |
 
 TP=4×PP=2=8 张一组，共 4 组数据并行。colocate 模式下训练完成后 SGLang 接管同一批 GPU 做推理，再同步权重后进入下一轮训练。
 
@@ -698,16 +698,37 @@ python bench.py --dataset swebench_verified --n 50
 
 ## 十一、运营与成本估算
 
-### 11.1 AWS 成本概估（500 rollout，4× p4de.24xlarge）
+### 11.1 推荐实例：p5.48xlarge（8× H100 80GB）
 
-| 资源 | 计算 | 金额（On-demand） | 金额（Spot ~70% off）|
-|---|---|---|---|
-| EC2（4× p4de.24xlarge @~$32.8/hr）| ~80h（500轮 × 580s/轮）| ~$10,500 | ~$3,200 |
-| AgentCore Runtime | 500×128 session × 200s_avg | ~$214 | ~$214 |
-| S3 存储/传输 | rollout 结果 + checkpoint | ~$20 | ~$20 |
-| **合计** | | **~$10,700** | **~$3,400** |
+**选择依据**：
+- 与 slime 参考脚本（`run-qwen3.5-27B.sh`）完全对齐
+- EFA 3,200 Gbps，跨节点 PP 通信无瓶颈
+- 每 GPU 80 GB HBM3，colocate 模式下训练+推理均够用
+- **Capacity Blocks 价格 $34.61/hr**，比 On-demand（~$55/hr）低 37%
 
-**建议**：先用 Spot 实例跑 50~100 rollout 的探索实验（~$340-680），验证 reward 有上升趋势后再扩到完整训练。p4de.24xlarge Spot 中断率相对较低，配合 `--save-interval 50` 可安全恢复。
+| 规模 | 实例数 | GPU 数 | 并行配置 | 价格/hr |
+|---|---|---|---|---|
+| 验证阶段 | 2× p5.48xlarge | 16× H100 | TP=4, PP=1, 4-DP | ~$69 (CB) |
+| 生产训练 | 4× p5.48xlarge | 32× H100 | TP=4, PP=2, 4-DP | ~$139 (CB) |
+| 升配选项 | 2× p5e.48xlarge | 16× H200 | TP=2, PP=1, 8-DP | ~$80 (CB) |
+
+CB = Capacity Blocks（预订固定时间段，无需年度承诺）
+
+### 11.2 AWS 成本概估（500 rollout，4× p5.48xlarge）
+
+| 资源 | 计算 | 金额（Capacity Blocks） |
+|---|---|---|
+| EC2（4× p5.48xlarge @$34.61/hr）| ~80h（500轮 × ~580s/轮）| ~$11,075 |
+| AgentCore Runtime | 500×128 session × 200s_avg | ~$214 |
+| S3 存储/传输 | rollout 结果 + checkpoint | ~$30 |
+| **合计** | | **~$11,320** |
+
+**采购策略**：
+- 第 0 周预检：1× p5.48xlarge On-demand 按小时（~$55 × 3h = **$165**）
+- 第 1-2 周开发调试：2× p5.48xlarge On-demand（≤20h，**~$2,200**）
+- 正式训练：4× p5.48xlarge Capacity Blocks 预订 96h（**$34.61 × 4 × 96 ≈ $13,290**）
+
+**不推荐 p4de.24xlarge**（A100）：EFA 仅 400 Gbps，跨节点 PP 通信是 p5 的 1/8，严重制约多节点训练效率。
 
 ### 11.2 数据集规模与多样性
 
