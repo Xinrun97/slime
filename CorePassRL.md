@@ -293,45 +293,55 @@ REWARD_WEIGHT_COST=0.0          # 训练时不惩罚 token 成本
 
 ## 七、Component E：数据集格式（`dataset.py`）
 
-**输入**：harness 原生任务格式（SWE-bench 或内部 bug 库），与 `collect_rollouts.py` 格式完全相同：
+**关键约束**：`cloud_run.py`（AgentCore 内执行 harness 的入口）读取的是 `RunConfig` 格式，要求字段为 `repo_url`、`base_branch`、`agent_branch`、`task`、`test_command`。**SWE-bench 的 `base_commit` + `test_patch` + Docker image 格式与此不兼容，无法直接使用。**
+
+**正确的训练任务格式**（与 harness 原生 RunConfig 对齐）：
 
 ```jsonl
 {
-  "instance_id": "django__django-1234",
+  "instance_id": "django-issue-1234",
   "config": {
-    "problem_statement": "Fix the issue where...",
-    "base_commit": "abc123",
-    "test_patch": "diff --git ...",
-    "max_steps": 50
+    "run_id": "rl-django-1234",
+    "repo_url": "https://github.com/our-org/our-repo",
+    "base_branch": "main",
+    "agent_branch": "rl-fix/django-1234",
+    "task": "Fix the bug where X causes Y when Z...",
+    "test_command": "python -m pytest tests/test_foo.py -x",
+    "setup_command": "pip install -e .",
+    "max_fix_attempts": 3
   },
-  "env_vars": { "GITHUB_TOKEN": "..." }
+  "env_vars": {}
 }
 ```
 
-**输出**：slime JSONL（`--prompt-data` 参数）。`config` 和 `env_vars` 原样嵌入 metadata，`rollout_fn.py` 直接透传给 AgentCore——评估由 harness 内部处理，不需要单独的 `eval_cmd` 字段：
+**注意**：`GITHUB_TOKEN` 不应放在 `env_vars` 字段（训练数据文件中），应在 AgentCore Runtime 容器层统一注入（AWS Secrets Manager 或容器环境变量），防止 token 泄露和轮转问题。
+
+**slime JSONL 输出格式**（`--prompt-data` 参数）：
 
 ```jsonl
 {
-  "prompt": "Fix the issue where...",
-  "label": "django__django-1234",
+  "prompt": "Fix the bug where X causes Y when Z...",
+  "label": "django-issue-1234",
   "metadata": {
-    "instance_id": "django__django-1234",
-    "config": {
-      "problem_statement": "Fix the issue where...",
-      "base_commit": "abc123",
-      "test_patch": "diff --git ...",
-      "max_steps": 50
-    },
-    "env_vars": { "GITHUB_TOKEN": "..." }
+    "instance_id": "django-issue-1234",
+    "config": { ... },
+    "env_vars": {}
   }
 }
+```
+
+**关于奖励格式**：`cloud_run.py` 的 `RunResult` 使用 `lifecycle_outcome` 字段（`"ready_for_review"` 或 `"failed"`），而 `agentcore_rl.py` 的 `_compute_reward` 调用 `compose_reward` 时依赖 `result.get("resolved")`。**需要在 `agentcore_rl.py` 中添加格式适配**：
+```python
+# 在 _compute_reward 中：
+result["resolved"] = (result.get("lifecycle_outcome") == "ready_for_review")
+result["f2p_passed"] = len([t for t in result.get("test_results", {}).get("passed", [])])
 ```
 
 转换命令：
 
 ```bash
 python examples/harness_rl/dataset.py \
-    --input /data/swebench_tasks.jsonl \
+    --input /data/internal_tasks.jsonl \
     --output /data/slime_tasks.jsonl
 ```
 
@@ -773,25 +783,113 @@ examples/harness_rl/
 
 ---
 
-## 十三、核心风险与对策
+## 十三、第一性原理审核
+
+RL 训练模型在智能体场景下持续提升，需要以下条件全部成立。以下是逐条核查结果：
+
+### 13.1 必要条件清单
+
+| # | 条件 | 要求 | 当前状态 | 行动 |
+|---|---|---|---|---|
+| 1 | 基础模型可被 slime 加载 | Qwen3.6-27B 架构需有对应 spec | ⚠ 需确认 | 核查 HF model card，比对 qwen3_5 spec 参数 |
+| 2 | 轨迹由当前策略生成 | shim 直连 SGLang，log_probs 来源于生成本身 | ✓ 架构正确 | 实现 shim 后验证 |
+| 3 | loss_mask 正确 | 模型输出=1，工具结果/system=0 | ✓ merge_turns() 已实现 | 跑 test_agent_trajectory.py |
+| 4 | 奖励有方差（基础模型非零成功率）| 至少 5% resolved rate | **✗ 未验证** | **训练前必须预测**，见下 |
+| 5 | 任务格式与 cloud_run.py 兼容 | RunConfig 格式（repo_url+branch） | **✗ 格式错误** | 已在第七章更正 |
+| 6 | 奖励字段格式一致 | agentcore_rl.py 需适配 RunResult 格式 | **✗ lifecycle_outcome ≠ resolved** | 已在第七章说明修改点 |
+| 7 | 训练域与部署域一致 | 训练任务 ≈ 实际使用场景 | ⚠ 需要混合内部任务 | 见第十一章 |
+
+### 13.2 阻断条件 #4：基础模型成功率（最重要）
+
+**RL 只能从成功中学习**。如果基础模型 resolved rate ≈ 0%，GRPO 的所有 group 都是全失败（零方差），dynamic_sampling_filter 过滤掉所有 group，训练步数 = 0 梯度，$10,000 打水漂。
+
+**必须在正式训练前做的预检（约 $50-100）：**
+
+```bash
+# 用基础模型（不做任何训练）跑 50-100 个训练任务
+python rl_data/collect_rollouts.py \
+    --agent_arn ${AGENTCORE_RUNTIME_ARN} \
+    --s3_bucket ${AGENTCORE_S3_BUCKET} \
+    --tasks_file /data/train_tasks_sample.jsonl \
+    --output_dir ./preflight_eval \
+    --limit 100 \
+    --model_id openai/qwen3.6-27b
+```
+
+**判断标准**：
+- resolved rate > 10%：可以开始 RL 训练
+- resolved rate 3-10%：建议先 SFT 暖启动，再 RL
+- resolved rate < 3%：任务太难；换更简单任务集，或先做 SFT
+
+### 13.3 阻断条件 #1：Qwen3.6-27B 架构确认
+
+从 slime 测试代码可知 Qwen3.6-35B-A3B 使用 `qwen3.5-35B-A3B` spec（即 qwen3_5 系列 spec 覆盖 Qwen3.6 MoE 架构）。Qwen3.6-27B 需要：
+
+1. 查阅 HuggingFace 上 `Qwen/Qwen3.6-27B` 的 `config.json`，确认 `model_type` 和架构参数
+2. 与 `slime_plugins/models/qwen3_5.py` + `scripts/models/qwen3.5-27B.sh` 的架构参数对比
+3. 若维度一致（hidden_size, num_layers 等），直接复用 `qwen3_5` spec + 更新架构参数
+4. 若 Qwen3.6-27B 是 MoE 而非 dense，参照 `qwen3.5-35B-A3B` 的配置方式
+
+### 13.4 shim 的正确性验证策略（最高工程风险）
+
+shim 是整个管道中唯一一个**错误不报警、但会静默污染训练数据**的组件。如果 loss_mask 有误或 token_ids 有偏移，模型会"训练"在错误的分布上，没有任何崩溃信号。
+
+**验证方案（三步）：**
+
+```
+Step 1：单轮验证
+  - 手动构造一条已知输入的对话（固定 messages + tools）
+  - 记录 shim 输出的 prompt_ids 和 output_ids
+  - 直接用 tokenizer.decode() 验证 ID 与文本一致
+  - 验证 output_ids 与 SGLang 实际生成的文本对应
+
+Step 2：loss_mask 验证  
+  - 运行一条含工具调用的完整 trajectory（tool call + tool result + model reply）
+  - 检查 TokenSegment.loss_mask：
+    · 工具调用前的 assistant 文本 → 1
+    · tool result 的 token → 0  
+    · tool result 之后的 assistant 文本 → 1
+  - 与 test_agent_trajectory.py 的用例交叉验证
+
+Step 3：log_probs 验证
+  - 对相同输入做两次独立生成（固定 temperature=0）
+  - 验证 log_probs 一致（确认 return_logprob=True 工作正常）
+  - 与 Megatron 的 ref_log_probs 计算对比（不能偏差超过 1e-4）
+```
+
+### 13.5 核心风险总结
 
 | 风险 | 概率 | 对策 |
 |---|---|---|
-| 奖励太稀疏（resolved rate < 5%） | 中 | 先用 `r_quality_det`（连续，只要有测试通过就有信号）；用更简单的任务集暖启动 |
-| AgentCore 并发/配额不足 | 低 | 默认 1000 session；`AGENTCORE_MAX_CONCURRENT` 控制上限；超量可申请提升 |
-| Qwen3-27B 显存不足 | 低 | TP=4（4×H100），必要时开 FP8 rollout（slime 已支持）|
-| shim 的 wipe 检测误判 | 低 | V1 可以先不检测 wipe，只损失压缩后的段不参与训练，不影响正确性 |
+| 基础模型在训练任务上 resolved rate < 3% | 中 | **训练前预检**（见 13.2）；必要时先 SFT |
+| Qwen3.6-27B 架构 slime 不支持 | 低 | 预检架构参数（见 13.3）；qwen3_5 spec 大概率覆盖 |
+| shim 静默错误污染训练数据 | 中 | 严格执行三步验证（见 13.4）后再扩规模 |
+| 任务格式与 cloud_run.py 不兼容 | ✓ 已发现 | 已在第七章修正为 RunConfig 格式 |
+| AgentCore 并发/配额不足 | 低 | 默认 1000 session；可申请提升 |
+| 训练域（内部任务）与评估域（SWE-bench）不一致 | 中 | 混合内部+公开任务；单独建立内部 eval 集 |
+| 显存不足 | 低 | colocate + optimizer-cpu-offload + FP8 rollout |
+| shim wipe 检测误判 | 低 | V1 可跳过 wipe 检测，损失压缩段但不影响正确性 |
 
 ---
 
 ## 十四、推进路线
 
 ```
+第 0 周（预检，花 $50-100，避免后续浪费$10,000）：
+  ├── 确认 Qwen3.6-27B HF config.json 架构参数 → 对比 qwen3_5 spec
+  ├── 准备 50-100 条 RunConfig 格式的训练任务（内部 bug 库）
+  ├── 用基础 Qwen3.6-27B 通过 collect_rollouts.py 跑预检评估
+  ├── 统计 resolved rate：
+  │   · > 10% → 直接 RL
+  │   · 3-10% → 先收集成功轨迹做 SFT，再 RL
+  │   · < 3%  → 任务太难，换更简单任务集后重试
+  └── 确认 cloud_run.py → RunResult 格式 → agentcore_rl.py reward 链路正确
+
 第 1 周：环境 + 连通性验证
-  ├── 搭建 Qwen3.5-4B 的 slime 训练环境（验证 Megatron+SGLang colocate 能跑）
+  ├── 搭建 Qwen3.5/3.6-4B 的 slime 训练环境（验证 Megatron+SGLang colocate 能跑）
   ├── 验证 AgentCore Runtime 已部署（setup_agentcore_runtime.py 已跑通）
   ├── 验证 shim（EC2 Head 节点）← AgentCore microVM 的 VPC 内网连通性
-  └── 转换 100 条 SWE-bench 任务为 slime JSONL 格式
+  └── 准备 RunConfig 格式的 slime JSONL 训练集（基于预检通过的任务）
 
 第 2 周：shim + rollout_fn（关键）
   ├── 实现 shim.py（重点：SGLang /generate + TurnRecord 记录 + --sglang-tool-call-parser）
