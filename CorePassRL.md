@@ -75,10 +75,20 @@ slime/
         └── README.md
 ```
 
-**不修改任何项目代码**：
-- `simple-coding-harness/src/services/sandbox/agentcore_rl.py` 已有 `@rollout_entrypoint`，直接用
-- `simple-coding-harness/rl_data/collect_rollouts.py` 的 `RolloutClient` 用法是参考模板
-- harness 的 Docker 镜像已部署到 AgentCore Runtime，包含所有依赖
+**harness 侧需修改一处（reward 格式适配）**：
+- `simple-coding-harness/src/services/sandbox/agentcore_rl.py`：修复 `_compute_reward` 的 RunResult→compose_reward 格式适配（见第七章），修复后需 rebuild Docker 镜像
+- `simple-coding-harness/rl_data/collect_rollouts.py`：`RolloutClient` 用法参考模板，直接用
+
+**Docker 镜像**（`docker/Dockerfile.rl`）：
+- 基于 `harness-cloud-agent:2.0`（已在 ECR）
+- 已打包 `cloud_run.py`、`agentcore_rl.py`、`src/`、`rl_data/` 等所有依赖
+- CMD：`python src/services/sandbox/agentcore_rl.py`
+- 已部署到：`348152033681.dkr.ecr.us-west-2.amazonaws.com/harness-cloud-agent-rl:latest`
+- 修复 reward bug 后重新 build + push：
+  ```bash
+  docker buildx build -f docker/Dockerfile.rl \
+    -t 348152033681.dkr.ecr.us-west-2.amazonaws.com/harness-cloud-agent-rl:latest --push .
+  ```
 
 ---
 
@@ -195,14 +205,20 @@ async def custom_generate(args, sample, sampling_params):
     task_config = sample.metadata.get("config", {})
     task_env_vars = sample.metadata.get("env_vars", {})
 
+    # agent_branch 必须唯一，防止并发 session 互相覆盖
+    # 格式：rl/{rollout_id}/{instance_id_slug}
+    instance_id = sample.metadata.get("instance_id", str(sample.index))
+    unique_branch = f"rl/{sample.rollout_id or sample.index}/{instance_id[:40]}"
+    task_config = {**task_config, "agent_branch": unique_branch}
+
     # 1. 提交到 AgentCore（异步，立刻返回 future）
-    #    env_vars 直接设置 QWEN36_27B_API_BASE 和 QWEN36_27B_API_KEY，
-    #    AgentCore 的 agentcore_rl.py 会把它们注入 harness 进程环境
+    #    GITHUB_TOKEN 已在 AgentCore Runtime 容器环境变量中，无需在 env_vars 传
+    #    env_vars 只传 LLM 路由相关的变量
     payload = {
         "action": "start",
         "config": task_config,
         "env_vars": {
-            **task_env_vars,  # 任务自带的 env（如 GITHUB_TOKEN）
+            **task_env_vars,  # 任务自带的非敏感 env
             "MODEL": "openai/qwen3.6-27b",
             "QWEN36_27B_API_BASE": f"{SHIM_PUBLIC_URL}/v1",
             "QWEN36_27B_API_KEY": session_id,  # shim 用此识别 session
@@ -315,7 +331,10 @@ REWARD_WEIGHT_COST=0.0          # 训练时不惩罚 token 成本
 }
 ```
 
-**注意**：`GITHUB_TOKEN` 不应放在 `env_vars` 字段（训练数据文件中），应在 AgentCore Runtime 容器层统一注入（AWS Secrets Manager 或容器环境变量），防止 token 泄露和轮转问题。
+**注意**：
+- `GITHUB_TOKEN` 不放在 `env_vars` 字段。在 AgentCore Runtime 部署时通过环境变量或 AWS Secrets Manager 注入到容器，`agentcore_rl.py` 会自动从 `os.environ["GITHUB_TOKEN"]` 读取（见 `_run_start_turn` 第 110 行）
+- `agent_branch` 每次训练 rollout 必须唯一，否则并发 session 会互相覆盖。建议格式：`rl/{rollout_id}/{instance_id}`，由 `rollout_fn.py` 在构造 payload 时动态生成
+- AgentCore 每个 session 启动时 `/workspace/repo` 为空目录，`cloud_run.py` 会执行 `git clone --depth=50`（约 10-30s）；若同一 instance 的上一 session 未清理，`cloud_run.py` 会 `git reset --hard` 复用已存在的 clone
 
 **slime JSONL 输出格式**（`--prompt-data` 参数）：
 
@@ -796,26 +815,55 @@ RL 训练模型在智能体场景下持续提升，需要以下条件全部成�
 | 1 | 基础模型可被 slime 加载 | Qwen3.6-27B 架构需有对应 spec | ⚠ 需确认 | 核查 HF model card，比对 qwen3_5 spec 参数 |
 | 2 | 轨迹由当前策略生成 | shim 直连 SGLang，log_probs 来源于生成本身 | ✓ 架构正确 | 实现 shim 后验证 |
 | 3 | loss_mask 正确 | 模型输出=1，工具结果/system=0 | ✓ merge_turns() 已实现 | 跑 test_agent_trajectory.py |
-| 4 | 奖励有方差（基础模型非零成功率）| 至少 5% resolved rate | **✗ 未验证** | **训练前必须预测**，见下 |
-| 5 | 任务格式与 cloud_run.py 兼容 | RunConfig 格式（repo_url+branch） | **✗ 格式错误** | 已在第七章更正 |
-| 6 | 奖励字段格式一致 | agentcore_rl.py 需适配 RunResult 格式 | **✗ lifecycle_outcome ≠ resolved** | 已在第七章说明修改点 |
-| 7 | 训练域与部署域一致 | 训练任务 ≈ 实际使用场景 | ⚠ 需要混合内部任务 | 见第十一章 |
+| 4 | 奖励有方差（基础模型非零成功率）| 至少 5% resolved rate | **✗ 未验证** | **训练前必须预检**，见下 |
+| 5 | 任务格式与 cloud_run.py 兼容 | RunConfig 格式（repo_url+branch） | ✓ 已更正 | 第七章已修正 |
+| 6 | 奖励字段格式一致 | agentcore_rl.py 需适配 RunResult 格式 | ✗ 现有镜像有 Bug | **修复后 rebuild 镜像** |
+| 7 | AgentCore 镜像含所有依赖 | cloud_run.py 在镜像中 | ✓ Dockerfile.rl 已确认 | 已有 ECR 镜像 |
+| 8 | 训练域与部署域一致 | 训练任务 ≈ 实际使用场景 | ⚠ 需要混合内部任务 | 见第十一章 |
 
 ### 13.2 阻断条件 #4：基础模型成功率（最重要）
 
 **RL 只能从成功中学习**。如果基础模型 resolved rate ≈ 0%，GRPO 的所有 group 都是全失败（零方差），dynamic_sampling_filter 过滤掉所有 group，训练步数 = 0 梯度，$10,000 打水漂。
 
-**必须在正式训练前做的预检（约 $50-100）：**
+**前提**：先修复 `agentcore_rl.py` 的 reward bug 并重新部署镜像，否则预检结果也不可信。
+
+**预检命令**（从 `simple-coding-harness` 目录运行）：
 
 ```bash
-# 用基础模型（不做任何训练）跑 50-100 个训练任务
+# QWEN36_27B_API_BASE 指向已在 EC2 上运行的 Qwen3.6-27B SGLang 服务
+# （预检期间可以手动启动一个 SGLang 服务，不需要 slime 完整训练环境）
+export QWEN36_27B_API_BASE=http://<SGLang-EC2-IP>:30000/v1
+
 python rl_data/collect_rollouts.py \
-    --agent_arn ${AGENTCORE_RUNTIME_ARN} \
+    --agent_arn ${AGENTCORE_RUNTIME_ARN} \          # 已部署的 RL 镜像 Runtime ARN
     --s3_bucket ${AGENTCORE_S3_BUCKET} \
-    --tasks_file /data/train_tasks_sample.jsonl \
-    --output_dir ./preflight_eval \
+    --tasks_file /data/preflight_tasks.jsonl \       # 50-100 条 RunConfig 格式任务
+    --output_dir ./preflight_results \
+    --exp_id "preflight-qwen36-$(date +%Y%m%d)" \
+    --model_id openai/qwen3.6-27b \                  # 触发 QWEN36_27B_API_BASE 路由
     --limit 100 \
-    --model_id openai/qwen3.6-27b
+    --max_concurrent 20 \
+    --timeout 600
+```
+
+**预检 tasks_file 格式**（`output_mode: branch_only`，不创建 PR）：
+
+```jsonl
+{
+  "instance_id": "task-001",
+  "config": {
+    "run_id": "preflight-001",
+    "repo_url": "https://github.com/your-org/your-repo",
+    "base_branch": "main",
+    "agent_branch": "preflight/fix-001",
+    "task": "Fix the NullPointerException in UserService.login() when email is empty",
+    "test_command": "python -m pytest tests/test_user_service.py::test_login -x",
+    "setup_command": "pip install -e . -q",
+    "max_fix_attempts": 2,
+    "output_mode": "branch_only"
+  },
+  "env_vars": {}
+}
 ```
 
 **判断标准**：
@@ -878,14 +926,18 @@ Step 3：log_probs 验证
 
 ```
 第 0 周（预检，花 $50-100，避免后续浪费$10,000）：
-  ├── 确认 Qwen3.6-27B HF config.json 架构参数 → 对比 qwen3_5 spec
-  ├── 准备 50-100 条 RunConfig 格式的训练任务（内部 bug 库）
-  ├── 用基础 Qwen3.6-27B 通过 collect_rollouts.py 跑预检评估
-  ├── 统计 resolved rate：
-  │   · > 10% → 直接 RL
-  │   · 3-10% → 先收集成功轨迹做 SFT，再 RL
-  │   · < 3%  → 任务太难，换更简单任务集后重试
-  └── 确认 cloud_run.py → RunResult 格式 → agentcore_rl.py reward 链路正确
+  ├── 0.1 确认 Qwen3.6-27B HF config.json 架构参数 → 对比 qwen3_5 spec 参数
+  ├── 0.2 修复 agentcore_rl.py::_compute_reward（RunResult → compose_reward 适配）
+  │        → rebuild + push docker/Dockerfile.rl 镜像到 ECR
+  │        → 更新 AgentCore Runtime 使用新镜像
+  ├── 0.3 配置 GITHUB_TOKEN 到 AgentCore Runtime 容器环境变量
+  ├── 0.4 手动启动 Qwen3.6-27B SGLang 服务（EC2），设置 QWEN36_27B_API_BASE
+  ├── 0.5 准备 50-100 条 RunConfig 格式的内部任务
+  ├── 0.6 运行 collect_rollouts.py 预检
+  └── 0.7 统计 lifecycle_outcome="ready_for_review" 的比例：
+          · > 10% → 可以开始 RL
+          · 3-10% → 先收集成功轨迹做 SFT 热启动，再 RL
+          · < 3%  → 任务太难，换更简单任务集
 
 第 1 周：环境 + 连通性验证
   ├── 搭建 Qwen3.5/3.6-4B 的 slime 训练环境（验证 Megatron+SGLang colocate 能跑）
