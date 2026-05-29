@@ -6,10 +6,11 @@
 
 **权重同步机制**（来自 `train.py:93`）：每个 rollout_id 循环末尾都执行 `actor_model.update_weights()`，把 Megatron 最新训练权重同步到 SGLang 推理引擎。因此每轮"生成→训练→生成→训练"循环中，下一轮生成用的就是当前最新的模型权重。
 
-**模型命名说明**：
-- **Qwen3.5-27B**：slime 已有完整支持（`--spec slime_plugins.models.qwen3_5`），本文档以此为例
-- **Qwen3.6-27B**：harness 中 `model_routes.py` 使用的模型路由标识符（`openai/qwen3.6-27b`），仅是 API 路由名称，不代表具体模型版本；实际指向我们的 shim，shim 转发给 slime 管理的 SGLang（运行 Qwen3.5-27B 权重）
-- 实际训练的基础模型权重为 **Qwen3.5-27B**
+**模型说明**：
+- **基础权重**：**Qwen3.6-27B**（HuggingFace 开放权重，训练起点）
+- **架构 spec**：`slime_plugins.models.qwen3_5`（Qwen3.6 与 Qwen3.5 架构相同，复用该 spec）
+- **使用方式**：`--spec qwen3_5` 描述模型结构，`--hf-checkpoint` 加载 Qwen3.6-27B 权重——spec 与权重独立，二者不需来自同一版本
+- **harness 路由名**：`openai/qwen3.6-27b` 是 harness `model_routes.py` 中的 API 路由标识，指向我们的 shim，最终由 SGLang 提供服务
 
 **关键发现**：simple-coding-harness 里已经有 `QWEN36_27B_API_BASE` / `QWEN36_27B_API_KEY` 这两个环境变量，专门为指向本地推理服务设计。`api_key` 会被 LiteLLM 作为 `Authorization: Bearer {key}` 发出——这和 `coding_agent_rl` 里把 session_id 塞进 `ANTHROPIC_AUTH_TOKEN` 的机制完全相同。
 
@@ -464,7 +465,7 @@ ray job submit → train.py → Ray 自动跨节点分配 GPU bundles → Megatr
 
 slime 的 `placement_group.py` 会跨节点收集所有 GPU（按节点 IP + GPU 编号排序），统一分配给 Megatron actor。Megatron 负责跨节点的 TP/PP/CP 并行通信（NCCL over EFA/InfiniBand）。
 
-### 9.2 Qwen3.5-27B（或 Qwen3.6-27B）并行策略（4节点 × 8×H100，colocate 模式）
+### 9.2 Qwen3.6-27B 并行策略（4节点 × 8×H100，colocate 模式）
 
 **GPU 分配**：4×8=32 张，全部同时用于训练和推理（`--colocate` 时间复用）。
 
@@ -547,10 +548,11 @@ RUNTIME_ENV_JSON=$(cat <<EOF
 EOF
 )
 
-# ── 前置步骤：需提前把 HF checkpoint 转换为 torch_dist 格式 ──
+# ── 前置步骤：把 Qwen3.6-27B HF checkpoint 转换为 torch_dist 格式 ──
+# Qwen3.6 与 Qwen3.5 架构相同，使用 qwen3_5 spec 转换 Qwen3.6 权重
 # python tools/convert_hf_to_torch_dist.py \
-#     --hf-checkpoint /root/models/Qwen3.5-27B \
-#     --output /root/models/Qwen3.5-27B_torch_dist
+#     --hf-checkpoint /root/models/Qwen3.6-27B \
+#     --output /root/models/Qwen3.6-27B_torch_dist
 
 ray job submit --address="http://127.0.0.1:8265" \
   --runtime-env-json="${RUNTIME_ENV_JSON}" \
@@ -559,7 +561,7 @@ ray job submit --address="http://127.0.0.1:8265" \
   --actor-num-gpus-per-node "${ACTOR_NUM_GPUS_PER_NODE}" \
   --colocate \
   \
-  # ── 模型架构（以 Qwen3.5-27B 为例；Qwen3.6-27B 需替换 spec）──
+  # ── 模型架构：Qwen3.6-27B 权重 + qwen3_5 spec（架构相同）──
   --spec "slime_plugins.models.qwen3_5" "get_qwen3_5_spec" \
   --num-layers 64 --hidden-size 5120 --ffn-hidden-size 17408 \
   --num-attention-heads 24 --num-query-groups 4 --kv-channels 256 \
@@ -568,11 +570,11 @@ ray job submit --address="http://127.0.0.1:8265" \
   --position-embedding-type rope --rotary-percent 0.25 --rotary-base 10000000 \
   --untie-embeddings-and-output-weights --attention-output-gate \
   \
-  # ── 检查点 ──────────────────────────────────────────────────
-  --hf-checkpoint /root/models/Qwen3.5-27B/ \
-  --ref-load /root/models/Qwen3.5-27B_torch_dist/ \
-  --load /root/models/Qwen3.5-27B_slime/ \
-  --save /root/models/Qwen3.5-27B_slime/ \
+  # ── 检查点（权重来自 Qwen3.6-27B）──────────────────────────
+  --hf-checkpoint /root/models/Qwen3.6-27B/ \
+  --ref-load /root/models/Qwen3.6-27B_torch_dist/ \
+  --load /root/models/Qwen3.6-27B_slime/ \
+  --save /root/models/Qwen3.6-27B_slime/ \
   \
   # ── 并行策略 ────────────────────────────────────────────────
   --tensor-model-parallel-size 4 \
@@ -580,7 +582,7 @@ ray job submit --address="http://127.0.0.1:8265" \
   --context-parallel-size 4 \
   --sequence-parallel \
   \
-  # ── 内存与效率（来自 run-qwen3.5-27B.sh 的生产配置）────────
+  # ── 内存与效率（来自 run-qwen3.5-27B.sh 参考配置，架构相同适用）──
   --recompute-granularity full --recompute-method uniform --recompute-num-layers 1 \
   --use-dynamic-batch-size --max-tokens-per-gpu 8192 \
   --calculate-per-token-loss \
@@ -826,7 +828,7 @@ python rl_data/collect_rollouts.py \
 从 slime 测试代码可知 Qwen3.6-35B-A3B 使用 `qwen3.5-35B-A3B` spec（即 qwen3_5 系列 spec 覆盖 Qwen3.6 MoE 架构）。Qwen3.6-27B 需要：
 
 1. 查阅 HuggingFace 上 `Qwen/Qwen3.6-27B` 的 `config.json`，确认 `model_type` 和架构参数
-2. 与 `slime_plugins/models/qwen3_5.py` + `scripts/models/qwen3.5-27B.sh` 的架构参数对比
+2. 与 `slime_plugins/models/qwen3_5.py` + `scripts/models/qwen3.5-27B.sh` 的架构参数对比（若一致则直接复用 spec，仅替换 `--hf-checkpoint` 为 Qwen3.6-27B 路径）
 3. 若维度一致（hidden_size, num_layers 等），直接复用 `qwen3_5` spec + 更新架构参数
 4. 若 Qwen3.6-27B 是 MoE 而非 dense，参照 `qwen3.5-35B-A3B` 的配置方式
 
@@ -904,8 +906,8 @@ Step 3：log_probs 验证
   │   验证：dynamic_sampling_filter 过滤掉全零 reward 的组
   └── 验证 reward 非零（用简单任务，confirm resolved rate > 0）
 
-第 3 周：扩到 Qwen3.5-27B + 正式训练
-  ├── 下载 Qwen3.5-27B HF checkpoint
+第 3 周：扩到 Qwen3.6-27B + 正式训练
+  ├── 下载 Qwen3.6-27B HF checkpoint
   ├── 运行 convert_hf_to_torch_dist.py 生成 _torch_dist 格式（--ref-load 用）
   ├── 用 launch.sh 跑第一个 100-step 训练，验证 reward 有上升趋势
   └── 监控 GPU 利用率，确认 train_async.py 的 rollout/training 重叠有效
