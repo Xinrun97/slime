@@ -4,7 +4,14 @@
 
 **架构定位**：slime 主导整个训练循环，simple-coding-harness 只提供 agent 逻辑（工具调用、文件编辑、多轮对话管理）。LLM 推理完全由 slime 管理的 SGLang 引擎负责，harness 的 LLM 调用经由 shim 透明转发给 SGLang，harness 自身感知不到这一层替换。
 
-**权重同步机制**（来自 `train.py:93`）：每个 rollout_id 循环末尾都执行 `actor_model.update_weights()`，把 Megatron 最新训练权重同步到 SGLang 推理引擎。因此每轮"生成→训练→生成→训练"循环中，下一轮生成用的就是当前最新的模型权重。
+**权重同步机制**：
+- **同步式 `train.py:93`**：每个 rollout_id 循环末尾都执行 `actor_model.update_weights()`，
+  下一轮生成用的就是当前最新权重——严格 on-policy。
+- **异步式 `train_async.py:73`（本方案采用）**：同步是**有条件**的——
+  `if (rollout_id + 1) % args.update_weights_interval == 0` 才执行。也就是说 rollout
+  用的是**滞后若干步**的权重，属于近 on-policy / off-policy。这是 train_async 用 rollout
+  与训练重叠换吞吐的代价，GRPO 的 importance ratio + eps-clip 能容忍适度滞后，但不要把它
+  描述成"严格 on-policy"。`update_weights_interval` 越大、滞后越多，需监控其对收敛的影响。
 
 **模型说明**：
 - **基础权重**：**Qwen3.6-27B**（HuggingFace 开放权重，训练起点）
@@ -159,7 +166,11 @@ def pop_session_split(store, session_id) -> list[TurnSegment]: ...  # 同 coding
 def shutdown_session(store, session_id): ...
 ```
 
-`pop_session_split` 和 `merge_turn_segments` 直接复用 `slime.agent.trajectory`，零重复代码。
+**修正**：只有 `merge_turns` / `merge_turn_segments` / `fan_out_sample_segments` 在
+`slime.agent.trajectory` 中（可直接 import 复用）。`open_session` / `pop_session_split` /
+`shutdown_session` 这三个**不在** slime，它们是 `examples/coding_agent_rl/middleware.py`
+里的实现（lines 584/604/619）。因此 shim.py 需要**照搬/改写**这套 session 管理逻辑——
+不是"零重复代码"，但可直接以 middleware.py 为模板。
 
 ### 3.6 与 coding_agent_rl/middleware.py 的对比
 
@@ -183,7 +194,13 @@ def shutdown_session(store, session_id): ...
 async def custom_generate(args, sample: Sample, sampling_params: dict) -> list[Sample]:
 ```
 
-### 4.2 完整流程（使用 AgentCore）
+### 4.2 完整流程（使用 AgentCore，逐样本 future 模式）
+
+> **⚠ 前置条件**：下面用到的 `invoke_async()` / `future.result_async(timeout=...)`
+> 属于 per-future API，**在 simple-coding-harness 仓库中无任何调用点，未经验证**
+> （见 §五的 API 形态修正）。仅当确认 `agentcore-rl-toolkit` 确实暴露该 API 后，
+> 才使用本节的 `--custom-generate-function-path` 写法；否则改用 §4.3 的 `run_batch`
+> 批处理路径（当前唯一已验证可行）。
 
 ```python
 SHIM_PUBLIC_URL = os.environ["SHIM_PUBLIC_URL"]   # 训练前 export，AgentCore 能访问的 shim 地址
@@ -258,6 +275,56 @@ async def custom_generate(args, sample, sampling_params):
 
 **关键点**：奖励由 AgentCore 内的 `agentcore_rl.py` 计算（调用 harness 自己的 `compose_reward`），通过 S3 返回。训练集群只取 `s3_result["rewards"]`，不需要重新运行评估。
 
+### 4.3 批处理流程（使用 `run_batch`，已验证可行，默认推荐）
+
+当 toolkit 只提供 `run_batch` 时，改用 `--rollout-function-path` 接管整轮编排。自定义
+rollout 函数一次性提交整批任务，迭代已完成结果，按 `session_id` 从 shim 取回轨迹：
+
+```python
+# --rollout-function-path examples.harness_rl.rollout_fn.generate_rollout
+async def generate_rollout(args, rollout_id, data_buffer, evaluation=False):
+    state = _State.get(args)              # tokenizer + shim + RolloutClient 单例
+    samples = data_buffer.get_samples(...)  # 本轮 rollout_batch × n_samples 个 Sample
+
+    # 为每个 sample 分配唯一 session_id，open_session，构造 payload
+    payloads, by_index = [], {}
+    for i, s in enumerate(samples):
+        sid = f"cagent-{s.index}-{s.group_index}-{secrets.token_hex(4)}"
+        open_session(state.store, sid, tokenizer=state.tokenizer,
+                     tools_schema=HARNESS_TOOLS_SCHEMA, sampling_defaults=...)
+        by_index[i] = (s, sid)
+        payloads.append({"action": "start",
+                         "config": {**s.metadata["config"], "agent_branch": _unique_branch(s)},
+                         "env_vars": {**s.metadata.get("env_vars", {}),
+                                      "MODEL": "openai/qwen3.6-27b",
+                                      "QWEN36_27B_API_BASE": f"{SHIM_PUBLIC_URL}/v1",
+                                      "QWEN36_27B_API_KEY": sid},
+                         "_idx": i})
+
+    out = []
+    # run_batch 是同步阻塞迭代器 → 用 asyncio.to_thread 避免阻塞事件循环
+    def _drain():
+        results = []
+        for item in state.client.run_batch(payloads,
+                                            max_concurrent_sessions=MAX_CONCURRENT,
+                                            timeout=SWE_TIME_BUDGET_SEC):
+            results.append(item)
+        return results
+    for item in await asyncio.to_thread(_drain):
+        s, sid = by_index[item.index]
+        segs = pop_session_split(state.store, sid); shutdown_session(state.store, sid)
+        if not item.success or not segs:
+            s.status = Sample.Status.ABORTED; out.append(s); continue
+        reward = float(item.result.get("rewards", 0.0))
+        out.extend(fan_out_sample_segments(s, segs, reward, state.tokenizer,
+                                           metadata={"s3_result": item.result}))
+    return out
+```
+
+注意：`run_batch` 内部用 `max_concurrent_sessions` 控制并发，**取代** slime 默认 rollout
+循环的逐样本并发；切换到 `--rollout-function-path` 后，dynamic_sampling / eval 等也需在
+此函数内自行处理（参考 `slime.rollout.sglang_rollout.generate_rollout` 的实现）。
+
 ---
 
 ## 五、Component C：AgentCore 客户端封装（`agentcore_client.py`）
@@ -282,7 +349,27 @@ def build_rollout_client() -> RolloutClient:
     )
 ```
 
-`RolloutClient` 本身管理并发、限流、指数退避轮询 S3——这些原来需要 DockerSandbox 手动实现的逻辑全部由 AgentCore 提供。
+构造参数已与 `rl_data/collect_rollouts.py:215` 的真实用法核对一致
+（`agent_runtime_arn` / `s3_bucket` / `exp_id` / `base_url` / `model_id` / `tps_limit` /
+`max_pool_connections`）。`RolloutClient` 本身管理并发、限流、指数退避轮询 S3——这些
+原来需要 DockerSandbox 手动实现的逻辑全部由 AgentCore 提供。
+
+**⚠ API 形态修正（影响 §四 的控制流选型）**：仓库里**唯一被实际使用**的提交 API 是
+**批处理迭代器**：
+```python
+for item in client.run_batch(payloads, max_concurrent_sessions=N, timeout=T):
+    # item.index / item.success / item.result / item.elapsed / item.error
+```
+而早期 §四 写的逐样本 `invoke_async()` + `await future.result_async(timeout=...)`
+（per-future 模式）**在本仓库中没有任何调用点**——它只在 `agentcore_rl.py` 的 docstring
+里被提及（"RolloutFuture can poll for completion"），属于**未经验证**的 API。
+
+因此第 0/1 周必须先确认 `agentcore-rl-toolkit` 的 `RolloutClient` 是否真的暴露
+per-future 的 `invoke_async`/`RolloutFuture`：
+- **若暴露** → 可保留 `--custom-generate-function-path`（逐样本，见 §4.2 写法）；
+- **若只有 `run_batch`** → 应改用 `--rollout-function-path` 接管整轮编排，在自定义
+  rollout 函数里一次性构造整批 payload、`run_batch` 迭代结果、按 `session_id` 取回
+  shim 轨迹再组装 Sample（见 §4.3）。**这是当前唯一已验证可行的路径，作为默认推荐。**
 
 ---
 
@@ -350,12 +437,56 @@ REWARD_WEIGHT_COST=0.0          # 训练时不惩罚 token 成本
 }
 ```
 
-**关于奖励格式**：`cloud_run.py` 的 `RunResult` 使用 `lifecycle_outcome` 字段（`"ready_for_review"` 或 `"failed"`），而 `agentcore_rl.py` 的 `_compute_reward` 调用 `compose_reward` 时依赖 `result.get("resolved")`。**需要在 `agentcore_rl.py` 中添加格式适配**：
+**关于奖励格式（⚠ 阻断级，比早期版本估计的严重得多）**
+
+经逐字段核对，`cloud_run.py` 的 `RunResult`（写入 result.json）只包含：
+- `lifecycle_outcome`（`"ready_for_review"` | `"failed"`）
+- `test_results`（dict：`{command, passed: bool, passed_count, failed_count, output_tail}`）
+- `changed_files`（list）、`commit_sha`、`branch`、`error_*`
+
+而 `rl_data/grpo/reward.py` 的 `compose_reward` / `deterministic_quality` 期望的字段
+**RunResult 一个都没有**：
+- `result["resolved"]`（`r_task` 直接据此取 ±1.0）
+- `result["f2p_total"]/["f2p_passed"]/["p2p_total"]/["p2p_passed"]`（`r_quality_det` 据此算比例）
+- `patch`（独立 kwarg，用于空 patch 惩罚）、`quality_llm`（独立 kwarg）
+
+**后果**：不修的话，`resolved` 恒为 False → `r_task` 恒为 -1；`f2p_total` 缺失 →
+`r_quality_det` 退化为 0。**即使模型把任务做对，reward 也几乎全为负、零方差**，
+`check_reward_nonzero_std` 会过滤掉所有 group → 0 梯度，整轮训练白跑且不报错。
+（注意：`collect_rollouts.py:_rebuild_reward` 在 `reward_breakdown` 存在时直接复用
+agentcore 算好的值，所以**预检阶段同样受此 bug 影响**——必须先修再预检，否则预检
+通过率也不可信。）
+
+**正确的最小修复（在 `agentcore_rl.py::_compute_reward` 内，调用 `compose_reward` 之前做归一化）**：
 ```python
-# 在 _compute_reward 中：
-result["resolved"] = (result.get("lifecycle_outcome") == "ready_for_review")
-result["f2p_passed"] = len([t for t in result.get("test_results", {}).get("passed", [])])
+def _normalize_run_result(result: dict) -> str:
+    """把 cloud_run.py 的 RunResult 字段映射成 compose_reward 期望的字段。
+    返回 patch 代理字符串（RunResult 不保存 patch 原文，仅用 changed_files 判空）。"""
+    tr = result.get("test_results") or {}
+    passed = bool(tr.get("passed", False))
+    pc = int(tr.get("passed_count", 0))
+    fc = int(tr.get("failed_count", 0))
+    # 本 harness 无 SWE-bench 的 fail2pass / pass2pass 区分，用 test_command 的
+    # 通过/失败计数近似 f2p；p2p_total=0 时 deterministic_quality 取 p2p_ratio=1.0
+    result["f2p_total"]  = pc + fc
+    result["f2p_passed"] = pc
+    result["p2p_total"]  = 0
+    result["p2p_passed"] = 0
+    # resolved：生命周期 ready_for_review 且测试确实通过
+    result["resolved"] = (result.get("lifecycle_outcome") == "ready_for_review") and passed
+    # RunResult 不保存 patch 原文；用 changed_files 作"是否有改动"的代理
+    return "x\n" if result.get("changed_files") else ""
+
+# _compute_reward 内：
+patch = _normalize_run_result(result)          # 替换原来的 result.get("patch", "")
+quality_llm = float(result.get("quality_llm", 0.0))  # 训练时 REWARD_WEIGHT_QUALITY_LLM=0，无影响
 ```
+
+**推荐的根治方案（更干净，长期采用）**：直接在 `cloud_run.py` 跑完 `test_command`
+后把 `resolved`、`f2p_*`、`p2p_*`、以及 `git diff` 得到的 `patch` 原文写进 `RunResult`，
+agentcore 侧就无需任何适配。无论选哪种，**改完后必须本地跑一条已知可解任务，打印
+`reward_breakdown` 确认 `r_task=+1.0`、`r_quality_det` 为预期非零值**——这是整个项目
+能否产生梯度的命门。
 
 转换命令：
 
@@ -452,7 +583,17 @@ train_async.py（本方案）：
   GPU 利用率显著提升，但仍受最慢样本影响
 ```
 
-进一步优化（V2）：使用 `--rollout-function-path slime.rollout.fully_async_rollout.generate_rollout_fully_async`，维持固定大小的 in-flight 任务池，训练步只取已完成的样本，彻底消除等待长尾的问题。适合稳定后的大规模训练。
+**⚠ colocate 与 train_async 的内在张力（重要修正）**：第 9.2 节用了 `--colocate`，即
+**同一批 GPU 在训练与 SGLang 推理之间按时间复用**——任一时刻只能二选一，不能真并行。
+因此 train_async 想要的"训练 N 的同时跑 rollout N+1"在 colocate 下**无法真正重叠**：
+训练占住 GPU 时 SGLang 让不出算力来服务 AgentCore 回打的推理请求。结论：
+- colocate + 长尾 SWE 任务 → GPU 空转**难以根治**，train_async 的收益有限；
+- 真正消除空转需要**分离推理资源**（disaggregated：另拨若干 GPU 常驻 SGLang），
+  代价是总 GPU 数上升、成本增加。
+不要把 train_async 当成"免费"提升利用率的手段。先用 colocate 跑通，再视实测 GPU 利用率
+决定是否分离推理或上 fully_async（V2）。
+
+进一步优化（V2）：使用 `--rollout-function-path slime.rollout.fully_async_rollout.generate_rollout_fully_async`，维持固定大小的 in-flight 任务池，训练步只取已完成的样本，彻底消除等待长尾的问题。**注意 fully_async 同样需要 SGLang 持续可服务推理，因此在纯 colocate 下收益依然受限**——它最适合"已分离出常驻推理算力"之后的大规模训练。
 
 ### 8.6 并发控制
 
@@ -502,7 +643,10 @@ TP=4×PP=2=8 张一组，共 4 组数据并行。colocate 模式下训练完成�
 
 ### 9.3 启动脚本（`launch.sh`）
 
-沙箱相关配置通过**环境变量**传入（slime 的 argument parser 不接受未定义参数）：
+沙箱相关配置通过**环境变量**传入。注意 slime 的 argument parser 用的是
+`parse_known_args`（`arguments.py:1496` 等），对未定义的 CLI 参数是**静默忽略**、
+而非报错——所以用 env var 传自定义配置是为了清晰，并非"parser 会拒绝"。
+反过来这也是个 footgun：**拼错的 `--flag` 不会报错，会被悄悄丢弃**，务必核对拼写：
 
 ```bash
 #!/bin/bash
@@ -573,35 +717,42 @@ EOF
 #     --hf-checkpoint /root/models/Qwen3.6-27B \
 #     --output /root/models/Qwen3.6-27B_torch_dist
 
+# ⚠ 重要：下面的 ray job submit 是一条反斜杠续行的单一命令。
+#   绝对不要在续行（\ 结尾的行）之间插入 `#` 行内注释——bash 会把
+#   `--colocate \` 与下一行的 `# 注释` 拼成 `--colocate # 注释`，
+#   注释吃掉续行符、命令在此截断，后面所有 --spec/--load/GRPO 参数全部丢失
+#   且不报错。所有说明性注释必须放在命令体之外（如本段）。
+#
+# 架构参数说明：以下 MODEL_ARGS 逐字复制自 scripts/models/qwen3.5-27B.sh，
+#   是 qwen3.5-27B 的真实架构定义。复用前提是 Qwen3.6-27B 与之架构一致——
+#   第 0 周必须 diff Qwen3.6-27B 的 config.json 确认（见 13.3）。
+#
+# batch 约束：--global-batch-size 必须 = --rollout-batch-size × --n-samples-per-prompt
+#   （此处 32 × 4 = 128）。
+
 ray job submit --address="http://127.0.0.1:8265" \
   --runtime-env-json="${RUNTIME_ENV_JSON}" \
   -- python3 train_async.py \
   --actor-num-nodes "${ACTOR_NUM_NODES}" \
   --actor-num-gpus-per-node "${ACTOR_NUM_GPUS_PER_NODE}" \
   --colocate \
-  \
-  # ── 模型架构：Qwen3.6-27B 权重 + qwen3_5 spec（架构相同）──
   --spec "slime_plugins.models.qwen3_5" "get_qwen3_5_spec" \
   --num-layers 64 --hidden-size 5120 --ffn-hidden-size 17408 \
   --num-attention-heads 24 --num-query-groups 4 --kv-channels 256 \
+  --group-query-attention \
   --vocab-size 248320 --swiglu --qk-layernorm --disable-bias-linear \
-  --normalization RMSNorm --norm-epsilon 1e-6 \
+  --use-gated-attention --attention-output-gate \
+  --normalization RMSNorm --apply-layernorm-1p --norm-epsilon 1e-6 \
   --position-embedding-type rope --rotary-percent 0.25 --rotary-base 10000000 \
-  --untie-embeddings-and-output-weights --attention-output-gate \
-  \
-  # ── 检查点（权重来自 Qwen3.6-27B）──────────────────────────
+  --untie-embeddings-and-output-weights \
   --hf-checkpoint /root/models/Qwen3.6-27B/ \
   --ref-load /root/models/Qwen3.6-27B_torch_dist/ \
   --load /root/models/Qwen3.6-27B_slime/ \
   --save /root/models/Qwen3.6-27B_slime/ \
-  \
-  # ── 并行策略 ────────────────────────────────────────────────
   --tensor-model-parallel-size 4 \
   --pipeline-model-parallel-size 2 \
   --context-parallel-size 4 \
   --sequence-parallel \
-  \
-  # ── 内存与效率（来自 run-qwen3.5-27B.sh 参考配置，架构相同适用）──
   --recompute-granularity full --recompute-method uniform --recompute-num-layers 1 \
   --use-dynamic-batch-size --max-tokens-per-gpu 8192 \
   --calculate-per-token-loss \
@@ -612,43 +763,38 @@ ray job submit --address="http://127.0.0.1:8265" \
   --attention-dropout 0.0 --hidden-dropout 0.0 \
   --accumulate-allreduce-grads-in-fp32 \
   --attention-softmax-in-fp32 --attention-backend flash \
-  \
-  # ── 数据 ────────────────────────────────────────────────────
   --prompt-data /data/slime_tasks.jsonl \
   --input-key prompt --label-key label \
   --apply-chat-template --rollout-shuffle \
   --balance-data \
-  \
-  # ── 集成入口 ────────────────────────────────────────────────
   --custom-generate-function-path examples.harness_rl.rollout_fn.custom_generate \
-  --dynamic-sampling-filter-path \
-      slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std \
-  \
-  # ── SGLang ──────────────────────────────────────────────────
+  --dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std \
   --rollout-num-gpus-per-engine 2 \
   --sglang-tool-call-parser qwen25 \
-  \
-  # ── GRPO ────────────────────────────────────────────────────
   --advantage-estimator grpo \
   --kl-coef 0.00 \
   --kl-loss-coef 0.00 --kl-loss-type low_var_kl \
   --eps-clip 0.2 --eps-clip-high 0.28 \
-  \
-  # ── Rollout ─────────────────────────────────────────────────
-  # global-batch-size 必须 = rollout-batch-size × n-samples-per-prompt
-  # 32 × 4 = 128；若想用 256 需把 rollout-batch-size 改为 64
   --num-rollout 500 \
   --rollout-batch-size 32 \
   --n-samples-per-prompt 4 \
   --rollout-max-response-len 8192 \
   --rollout-temperature 1.0 \
   --global-batch-size 128 \
-  \
-  # ── 保存与评估 ───────────────────────────────────────────────
   --save-interval 50 \
   --eval-interval 50 \
   --eval-prompt-data /data/swebench_test.jsonl
 ```
+
+> **架构 flag 补全说明**：早期版本的本脚本遗漏了 `--group-query-attention`、
+> `--use-gated-attention`、`--apply-layernorm-1p` 三个 flag。它们都在
+> `scripts/models/qwen3.5-27B.sh` 中，遗漏会导致前向计算与权重布局不匹配
+> （加载报错，或更糟——静默错误）。已补齐。
+>
+> **rollout 路径说明**：脚本中用的是 `--custom-generate-function-path`（逐样本，依赖
+> 未验证的 `invoke_async`）。若 toolkit 仅有 `run_batch`，应改为
+> `--rollout-function-path examples.harness_rl.rollout_fn.generate_rollout`（见 §4.3），
+> 并移除 `--custom-generate-function-path`。两者二选一，取决于 §五确认的 toolkit API。
 
 关键参数说明：
 
@@ -769,7 +915,7 @@ CB = Capacity Blocks（预订固定时间段，无需年度承诺）
 | `custom_generate` 签名 | `sglang_rollout.py:267-275` | 高（公开 API） | 无风险 |
 | `Sample` 字段及 `sample.reward` 预填跳过 RM | `sglang_rollout.py:297-300` | 高（向后兼容） | 无风险 |
 | `args.sglang_router_ip/port` 自动注入 | slime 启动时设置 | 高 | 无风险 |
-| 每步 `update_weights()` 同步到 SGLang | `train.py:93` | 高（核心机制） | 无风险 |
+| `update_weights()` 同步到 SGLang | `train.py:93`（每步）/ `train_async.py:73`（按 `update_weights_interval`） | 高（核心机制） | 无风险；注意 async 下是按 interval 同步，非每步 |
 | `TurnRecord`, `merge_turns` | `slime/agent/trajectory.py` | 中（内部但稳定） | slime 更新时跑 `test_agent_trajectory.py` 验证 |
 | `fan_out_sample_segments` | `slime/agent/trajectory.py` | 中 | 同上 |
 
@@ -838,9 +984,10 @@ RL 训练模型在智能体场景下持续提升，需要以下条件全部成�
 | 3 | loss_mask 正确 | 模型输出=1，工具结果/system=0 | ✓ merge_turns() 已实现 | 跑 test_agent_trajectory.py |
 | 4 | 奖励有方差（基础模型非零成功率）| 至少 5% resolved rate | **✗ 未验证** | **训练前必须预检**，见下 |
 | 5 | 任务格式与 cloud_run.py 兼容 | RunConfig 格式（repo_url+branch） | ✓ 已更正 | 第七章已修正 |
-| 6 | 奖励字段格式一致 | agentcore_rl.py 需适配 RunResult 格式 | ✗ 现有镜像有 Bug | **修复后 rebuild 镜像** |
+| 6 | 奖励字段格式一致 | RunResult 需补 `resolved`/`f2p_*`/`p2p_*`/`patch` 才能喂给 `compose_reward` | **✗ 阻断级**：缺口比"改一行"大得多，不修则 reward 恒负、零方差、0 梯度 | **按 §七正确映射修复，本地验证 reward_breakdown 后 rebuild 镜像** |
 | 7 | AgentCore 镜像含所有依赖 | cloud_run.py 在镜像中 | ✓ Dockerfile.rl 已确认 | 已有 ECR 镜像 |
 | 8 | 训练域与部署域一致 | 训练任务 ≈ 实际使用场景 | ⚠ 需要混合内部任务 | 见第十一章 |
+| 9 | rollout 提交 API 存在 | toolkit 暴露逐样本 `invoke_async` 或批处理 `run_batch` | ⚠ 仅 `run_batch` 已验证；per-future 未验证 | 确认 toolkit API → 选 `--custom-generate`（per-future）或 `--rollout-function-path`（run_batch，默认）|
 
 ### 13.2 阻断条件 #4：基础模型成功率（最重要）
 
@@ -932,6 +1079,9 @@ Step 3：log_probs 验证
 
 | 风险 | 概率 | 对策 |
 |---|---|---|
+| **reward 管线字段缺口**导致 reward 恒负/零方差/0 梯度（静默） | **高** | 按 §七正确映射 RunResult→compose_reward；改完本地验证 `reward_breakdown` 再 rebuild（最高优先级） |
+| RolloutClient 无 per-future API，逐样本 `invoke_async` 不可用 | 中 | 默认走 §4.3 的 `run_batch` + `--rollout-function-path`；先确认 toolkit API |
+| launch.sh 续行内 `#` 注释截断训练命令（静默残缺启动） | 已修复 | 命令体内禁止行内注释；架构 flag 已对齐 qwen3.5-27B.sh |
 | 基础模型在训练任务上 resolved rate < 3% | 中 | **训练前预检**（见 13.2）；必要时先 SFT |
 | Qwen3.6-27B 架构 slime 不支持 | 低 | 预检架构参数（见 13.3）；qwen3_5 spec 大概率覆盖 |
 | shim 静默错误污染训练数据 | 中 | 严格执行三步验证（见 13.4）后再扩规模 |
@@ -946,7 +1096,11 @@ Step 3：log_probs 验证
 ## 十四、推进路线
 
 ```
-第 0 周（预检，花 $50-100，避免后续浪费$10,000）：
+第 0 周（预检，避免后续浪费 $10,000+）：
+  ⚠ 成本修正：预检并非 "$50-100"。collect_rollouts.py 需要一个**在线的
+     Qwen3.6-27B SGLang 服务**（27B bf16 ≈ 54GB 权重，叠加 KV cache 实际需 1-2×H100），
+     预检跑 50-100 条任务 × 多轮、每轮数分钟，这台 p5 开数小时即数百美元。
+     合理预算按 1× p5.48xlarge On-demand × 半天 ≈ **$300-400** 计。
   ├── 0.1 确认 Qwen3.6-27B HF config.json 架构参数 → 对比 qwen3_5 spec 参数
   ├── 0.2 修复 agentcore_rl.py::_compute_reward（RunResult → compose_reward 适配）
   │        → rebuild + push docker/Dockerfile.rl 镜像到 ECR
